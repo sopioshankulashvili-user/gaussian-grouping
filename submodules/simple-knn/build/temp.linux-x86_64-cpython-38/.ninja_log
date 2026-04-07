@@ -1,0 +1,4 @@
+# ninja log v7
+0	13892	1773395402262410485	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/simple_knn.o	b7f157748f4eddae
+0	24575	1773395402262410485	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/ext.o	d168e188fc86b2fb
+1	51626	1773395402262410485	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/spatial.o	3a3a12826070a785

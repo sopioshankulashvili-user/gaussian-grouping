@@ -8,6 +8,7 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim, loss_cls_3d
 from gaussian_renderer import render, network_gui
@@ -21,6 +22,115 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 import json
+from pathlib import Path
+from PIL import Image
+import numpy as np
+from utils.graphics_utils import geom_transform_points
+from height_constraint import (
+    detect_flat_surface_height,
+    create_road_height_constraint,
+    fit_plane_to_points,
+    fit_plane_to_points_axis_agnostic,
+    compute_constraint_values_along_normal
+)
+
+
+class RoadConstraintManager:
+    def __init__(self, road_mask_path, source_path=None):
+        self.enabled = bool(road_mask_path)
+        self.source_path = Path(source_path) if source_path else None
+        self.road_mask_path = Path(road_mask_path) if self.enabled else None
+        if self.enabled and self.road_mask_path is not None and not self.road_mask_path.is_absolute() and self.source_path is not None:
+            self.road_mask_path = self.source_path / self.road_mask_path
+        self._mask_cache = {}
+
+    def _load_mask(self, image_name):
+        if not self.enabled:
+            return None
+
+        if image_name in self._mask_cache:
+            return self._mask_cache[image_name]
+
+        mask_file = self.road_mask_path / f"{image_name}.png"
+        if not mask_file.exists():
+            self._mask_cache[image_name] = None
+            return None
+
+        mask_np = np.array(Image.open(mask_file).convert("L"), dtype=np.uint8)
+        mask_tensor = torch.from_numpy((mask_np > 0).astype(np.bool_)).cuda()
+        self._mask_cache[image_name] = mask_tensor
+        return mask_tensor
+
+    def build_visible_road_mask(self, gaussians, viewpoint_cam, visibility_filter):
+        road_mask_2d = self._load_mask(viewpoint_cam.image_name)
+        print("road_mask_2d size of mask ", road_mask_2d.shape if road_mask_2d is not None else "None")
+        if road_mask_2d is None:
+            return None
+
+        width = int(viewpoint_cam.image_width)
+        height = int(viewpoint_cam.image_height)
+        if road_mask_2d.shape[0] != height or road_mask_2d.shape[1] != width:
+            print(f"[RoadConstraint] Warning: Road mask for view '{viewpoint_cam.image_name}' has shape {road_mask_2d.shape}, expected ({height}, {width}). Resizing mask to fit.")
+            road_mask_2d = F.interpolate(
+                road_mask_2d.float().unsqueeze(0).unsqueeze(0),
+                size=(height, width),
+                mode="nearest"
+            ).squeeze(0).squeeze(0).bool()
+
+        visible_indices = torch.where(visibility_filter)[0]
+        if visible_indices.numel() == 0:
+            return None
+
+        xyz_visible = gaussians.get_xyz[visible_indices]
+        projected_ndc = geom_transform_points(xyz_visible, viewpoint_cam.full_proj_transform)
+
+        px = ((projected_ndc[:, 0] + 1.0) * 0.5 * (width - 1)).long()
+        py = ((1.0 - projected_ndc[:, 1]) * 0.5 * (height - 1)).long()
+
+        in_bounds = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+        if not in_bounds.any():
+            return None
+
+        visible_indices = visible_indices[in_bounds]
+        px = px[in_bounds]
+        py = py[in_bounds]
+        on_road = road_mask_2d[py, px]
+        if not on_road.any():
+            return None
+
+        road_indices = visible_indices[on_road]
+        full_mask = torch.zeros((gaussians.get_xyz.shape[0]), device=gaussians.get_xyz.device, dtype=torch.bool)
+        full_mask[road_indices] = True
+        return full_mask
+
+
+def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 1.0)):
+    if gaussians.plane_normal is None or gaussians.plane_centroid is None:
+        return 0
+
+    xyz = gaussians.get_xyz
+    if xyz.numel() == 0:
+        return 0
+
+    plane_normal = torch.from_numpy(gaussians.plane_normal).float().to(device=xyz.device)
+    plane_centroid = torch.from_numpy(gaussians.plane_centroid).float().to(device=xyz.device)
+
+    up_axis_tensor = torch.tensor(up_axis, dtype=torch.float32, device=xyz.device)
+    up_norm = torch.norm(up_axis_tensor)
+    if up_norm > 0:
+        up_axis_tensor = up_axis_tensor / up_norm
+        if torch.dot(plane_normal, up_axis_tensor) < 0:
+            plane_normal = -plane_normal
+
+    signed_distance = ((xyz - plane_centroid.unsqueeze(0)) * plane_normal.unsqueeze(0)).sum(dim=1)
+    prune_mask = signed_distance > float(margin)
+
+    if not prune_mask.any():
+        return 0
+
+    prune_count = int(prune_mask.sum().item())
+    gaussians.prune_points(prune_mask)
+    return prune_count
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
@@ -34,6 +144,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
     classifier.cuda()
+    road_manager = RoadConstraintManager(
+        getattr(dataset, "road_mask_path", "object_mask_road"),
+        source_path=getattr(dataset, "source_path", None)
+    )
+    road_constraints_active = opt.flattened_road and road_manager.enabled
+
+    if opt.flattened_road and not road_manager.enabled:
+        print("[RoadConstraint] Disabled because --road_mask_path is empty.")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -83,6 +201,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii, objects = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_object"]
 
+        if road_constraints_active and iteration % max(1, opt.road_constraint_every) == 0:
+            road_gaussian_mask = road_manager.build_visible_road_mask(gaussians, viewpoint_cam, visibility_filter)
+            if road_gaussian_mask is not None and road_gaussian_mask.sum().item() >= opt.road_min_points:
+                # Use AXIS-AGNOSTIC plane fitting (works with any axis orientation)
+                print(f"[RoadConstraint] Applying height constraint using {road_gaussian_mask.sum().item()} visible road points.")
+                constraint_values, plane_info = create_road_height_constraint(
+                    gaussians, 
+                    road_gaussian_mask, 
+                    # height_value=0.0, #if we want to hardcode height
+                    method='fit_plane_axis_agnostic'
+                )
+            else:
+                gaussians.clear_height_constraint()
+                if road_gaussian_mask is None:
+                    print("road gaussian mask: ", road_gaussian_mask)
+                    print(f"[RoadConstraint] No usable mask for view '{viewpoint_cam.image_name}'. Skipping until masks are available.")
+
         # Object Loss
         gt_obj = viewpoint_cam.objects.cuda().long()
         logits = classifier(objects)
@@ -94,6 +229,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
 
         loss_obj_3d = None
+        loss_road_height = None
+        loss_road_hole = None
         if iteration % opt.reg3d_interval == 0:
             # regularize at certain intervals
             logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
@@ -102,6 +239,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj
+
+        if road_constraints_active and gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0] and gaussians.height_constrained_mask.any():
+            constrained_mask = gaussians.height_constrained_mask
+            constrained_xyz = gaussians.get_xyz[constrained_mask]
+            constrained_targets = gaussians.height_constraint_values[constrained_mask]
+            
+            # Compute height loss based on constraint type (axis-agnostic or legacy)
+            if gaussians.plane_normal is not None:
+                # AXIS-AGNOSTIC: Use plane normal direction
+                import torch as torch_module
+                plane_normal = torch_module.from_numpy(gaussians.plane_normal).float().to(device=constrained_xyz.device)
+                plane_centroid = torch_module.from_numpy(gaussians.plane_centroid).float().to(device=constrained_xyz.device)
+                
+                # Compute current distance along plane normal
+                current_vec = constrained_xyz - plane_centroid.unsqueeze(0)
+                current_distance = (current_vec * plane_normal.unsqueeze(0)).sum(dim=1)
+                
+                # Distance error from target
+                loss_road_height = torch.mean((current_distance - constrained_targets) ** 2)
+            else:
+                # LEGACY: Z-axis only
+                loss_road_height = torch.mean((constrained_xyz[:, 2] - constrained_targets) ** 2)
+            
+            loss = loss + opt.road_height_loss_weight * loss_road_height
+
+            constrained_opacity = gaussians.get_opacity[constrained_mask].squeeze(-1)
+            loss_road_hole = torch.relu(opt.road_min_opacity - constrained_opacity).mean()
+            loss = loss + opt.road_hole_loss_weight * loss_road_hole
 
         loss.backward()
         iter_end.record()
@@ -135,9 +300,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
+            if road_constraints_active and opt.remove_above_road and iteration % max(1, opt.road_remove_every) == 0:
+                pruned_count = prune_gaussians_above_road_plane(
+                    gaussians,
+                    margin=opt.road_above_margin,
+                    up_axis=opt.road_up_axis,
+                )
+                if pruned_count > 0:
+                    print(f"[RoadConstraint] Pruned {pruned_count} gaussians above road plane (margin={opt.road_above_margin:.4f}).")
+
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
+                if road_constraints_active:
+                    gaussians.apply_height_constraint_to_gradients(blend=opt.road_height_blend)
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 cls_optimizer.step()
                 cls_optimizer.zero_grad()
@@ -238,6 +414,25 @@ if __name__ == "__main__":
     args.reg3d_lambda_val = config.get("reg3d_lambda_val", 2)
     args.reg3d_max_points = config.get("reg3d_max_points", 300000)
     args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
+    args.flattened_road = config.get("flattened_road", args.flattened_road)
+    args.road_constraint_every = config.get("road_constraint_every", args.road_constraint_every)
+    args.road_min_points = config.get("road_min_points", args.road_min_points)
+    args.road_height_loss_weight = config.get("road_height_loss_weight", args.road_height_loss_weight)
+    args.road_hole_loss_weight = config.get("road_hole_loss_weight", args.road_hole_loss_weight)
+    args.road_min_opacity = config.get("road_min_opacity", args.road_min_opacity)
+    args.road_height_blend = config.get("road_height_blend", args.road_height_blend)
+    args.remove_above_road = config.get("remove_above_road", args.remove_above_road)
+    args.road_remove_every = config.get("road_remove_every", args.road_remove_every)
+    args.road_above_margin = config.get("road_above_margin", args.road_above_margin)
+
+    road_up_axis_cfg = config.get("road_up_axis", args.road_up_axis)
+    if isinstance(road_up_axis_cfg, str):
+        axis_vals = [float(v.strip()) for v in road_up_axis_cfg.split(",") if v.strip()]
+    else:
+        axis_vals = list(road_up_axis_cfg)
+    if len(axis_vals) != 3:
+        raise ValueError("road_up_axis must contain 3 values, e.g. [0, 0, 1] or '0,0,1'.")
+    args.road_up_axis = tuple(axis_vals)
     
     print("Optimizing " + args.model_path)
 

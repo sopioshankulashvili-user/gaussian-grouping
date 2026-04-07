@@ -1,0 +1,13 @@
+{
+  "num_classes": 200,
+  "select_obj_id": [34],
+  "removal_thresh": 0.3,
+  "images": "images",
+  "object_path": "object_mask",
+  "r": 1,
+  "lambda_dlpips": 0.5,
+  "reposition_lambda_ssim": 0.2,
+  "finetune_iteration": 10000,
+  "translation": [0.15, 0.0, 0.0],
+  "pseudo_gt_path": "/path/to/pseudo_gt_images"
+}

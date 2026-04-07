@@ -76,8 +76,13 @@ def removal_setup(opt, model_path, iteration, views, gaussians, pipeline, backgr
         mask = prob_obj3d[selected_obj_ids, :, :] > removal_thresh
         mask3d = mask.any(dim=0).squeeze()
 
-        mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(),mask3d,outlier_factor=1.0)
-        mask3d = torch.logical_or(mask3d,mask3d_convex)
+        skip_convex_for_background = bool((selected_obj_ids == 0).any().item())
+        if not skip_convex_for_background:
+            mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(), mask3d, outlier_factor=1.0)
+            mask3d = torch.logical_or(mask3d, mask3d_convex)
+        else:
+            reason = "selected background id 0"
+            print(f"Skipping convex hull expansion ({reason}).")
 
         mask3d = mask3d.float()[:,None,None]
 

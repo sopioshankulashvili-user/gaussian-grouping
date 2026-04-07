@@ -53,10 +53,116 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.inpaint_mask = torch.empty(0, dtype=torch.bool)
+        self.height_constrained_mask = torch.empty(0, dtype=torch.bool)
+        self.height_constraint_values = torch.empty(0)
+        self.plane_normal = None  # For axis-agnostic constraints: normal vector of the constraint plane
+        self.plane_centroid = None  # Centroid of the constraint plane
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+    def get_inpaint_mask(self):
+        n_points = self.get_xyz.shape[0]
+        if self.inpaint_mask.numel() != n_points:
+            self.inpaint_mask = torch.zeros((n_points), device=self.get_xyz.device, dtype=torch.bool)
+        else:
+            self.inpaint_mask = self.inpaint_mask.to(device=self.get_xyz.device, dtype=torch.bool)
+        return self.inpaint_mask
+
+    def _sync_height_constraint_tensors(self):
+        n_points = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        if self.height_constrained_mask.numel() != n_points:
+            self.height_constrained_mask = torch.zeros((n_points), device=device, dtype=torch.bool)
+        else:
+            self.height_constrained_mask = self.height_constrained_mask.to(device=device, dtype=torch.bool)
+
+        if self.height_constraint_values.numel() != n_points:
+            self.height_constraint_values = torch.zeros((n_points), device=device, dtype=self.get_xyz.dtype)
+        else:
+            self.height_constraint_values = self.height_constraint_values.to(device=device, dtype=self.get_xyz.dtype)
+
+    def set_height_constraint(self, mask, height_value, plane_info=None):
+        """
+        Set height constraints for Gaussians.
+        
+        Args:
+            mask: Boolean tensor indicating constrained points
+            height_value: Scalar or per-point height values
+            plane_info: Optional dict with 'normal', 'centroid', 'd' from fit_plane_to_points_axis_agnostic()
+        """
+        self._sync_height_constraint_tensors()
+        constraint_mask = mask.to(device=self.get_xyz.device, dtype=torch.bool)
+        if constraint_mask.numel() != self.get_xyz.shape[0]:
+            raise ValueError("Constraint mask size must match number of Gaussians.")
+
+        self.height_constrained_mask = constraint_mask
+        
+        # Store plane info for axis-agnostic constraints
+        if plane_info is not None:
+            self.plane_normal = plane_info.get('normal')  # numpy array (3,)
+            self.plane_centroid = plane_info.get('centroid')  # numpy array (3,)
+        
+        if torch.is_tensor(height_value):
+            if height_value.numel() == 1:
+                self.height_constraint_values[constraint_mask] = height_value.to(device=self.get_xyz.device, dtype=self.get_xyz.dtype)
+            elif height_value.numel() == self.get_xyz.shape[0]:
+                self.height_constraint_values[constraint_mask] = height_value.to(device=self.get_xyz.device, dtype=self.get_xyz.dtype)[constraint_mask]
+            else:
+                raise ValueError("height_value tensor must be scalar or per-point with matching length.")
+        else:
+            self.height_constraint_values[constraint_mask] = float(height_value)
+
+    def clear_height_constraint(self):
+        self._sync_height_constraint_tensors()
+        self.height_constrained_mask.zero_()
+        self.height_constraint_values.zero_()
+        self.plane_normal = None
+        self.plane_centroid = None
+
+    def apply_height_constraint_to_gradients(self, blend=1.0):
+        """
+        Apply height constraints to Gaussians by projecting positions onto the constraint plane.
+        Supports both axis-agnostic (plane normal) and legacy (Z-axis) constraints.
+        
+        Args:
+            blend: Blending factor (0.0 = no constraint, 1.0 = full constraint)
+        """
+        self._sync_height_constraint_tensors()
+        if not self.height_constrained_mask.any():
+            return
+
+        blend = max(0.0, min(1.0, float(blend)))
+        with torch.no_grad():
+            constrained_mask = self.height_constrained_mask
+            
+            if self.plane_normal is not None:
+                # AXIS-AGNOSTIC: Use plane normal to constrain
+                plane_normal = torch.from_numpy(self.plane_normal).float().to(device=self._xyz.device)
+                plane_centroid = torch.from_numpy(self.plane_centroid).float().to(device=self._xyz.device)
+                
+                constrained_xyz = self._xyz.data[constrained_mask]
+                target_distance = self.height_constraint_values[constrained_mask]
+                
+                # Current distance from plane along normal
+                current_vec = constrained_xyz - plane_centroid.unsqueeze(0)
+                current_distance = (current_vec * plane_normal.unsqueeze(0)).sum(dim=1)
+                
+                # Compute correction
+                distance_error = current_distance - target_distance
+                
+                # Apply correction along plane normal
+                correction = distance_error.unsqueeze(1) * plane_normal.unsqueeze(0)
+                blended_correction = blend * correction
+                
+                self._xyz.data[constrained_mask] -= blended_correction
+            else:
+                # LEGACY: Constrain Z-axis only
+                constrained_z = self._xyz.data[constrained_mask, 2]
+                target_z = self.height_constraint_values[constrained_mask]
+                self._xyz.data[constrained_mask, 2] = (1.0 - blend) * constrained_z + blend * target_z
 
     def capture(self):
         return (
@@ -156,6 +262,9 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._objects_dc = nn.Parameter(fused_objects.transpose(1, 2).contiguous().requires_grad_(True))
+        self.inpaint_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
+        self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
+        self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=self.get_xyz.dtype)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -195,6 +304,9 @@ class GaussianModel:
         hook_rotation = self._rotation.register_hook(mask_hook2)
 
         self._objects_dc.requires_grad = False
+        self.inpaint_mask = mask3d.bool().squeeze().to(device=self.get_xyz.device)
+        self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+        self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.percent_dense = training_args.percent_dense
@@ -239,6 +351,9 @@ class GaussianModel:
         self._scaling = nn.Parameter(set_requires_grad(scaling_sub, False))
         self._rotation = nn.Parameter(set_requires_grad(rotation_sub, False))
         self._objects_dc = nn.Parameter(set_requires_grad(objects_dc_sub, False))
+        self.inpaint_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+        self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+        self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
 
 
     def inpaint_setup(self, training_args, mask3d):
@@ -326,6 +441,15 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.cat([set_requires_grad(scaling_sub, False), set_requires_grad(new_scaling, True)]))
         self._rotation = nn.Parameter(torch.cat([set_requires_grad(rotation_sub, False), set_requires_grad(new_rotation, True)]))
         self._objects_dc = nn.Parameter(torch.cat([set_requires_grad(objects_dc_sub, False), set_requires_grad(new_objects_dc, True)]))
+
+        num_fixed = xyz_sub.shape[0]
+        num_inpaint = new_xyz.shape[0]
+        self.inpaint_mask = torch.cat([
+            torch.zeros((num_fixed), device=self.get_xyz.device, dtype=torch.bool),
+            torch.ones((num_inpaint), device=self.get_xyz.device, dtype=torch.bool)
+        ], dim=0)
+        self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+        self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
 
         # for optimize
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -440,6 +564,9 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._objects_dc = nn.Parameter(torch.tensor(objects_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self.inpaint_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
+        self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
+        self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=self.get_xyz.dtype)
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -492,6 +619,20 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.inpaint_mask.numel() == valid_points_mask.shape[0]:
+            self.inpaint_mask = self.inpaint_mask[valid_points_mask]
+        else:
+            self.inpaint_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+
+        if self.height_constrained_mask.numel() == valid_points_mask.shape[0]:
+            self.height_constrained_mask = self.height_constrained_mask[valid_points_mask]
+        else:
+            self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+
+        if self.height_constraint_values.numel() == valid_points_mask.shape[0]:
+            self.height_constraint_values = self.height_constraint_values[valid_points_mask]
+        else:
+            self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -515,7 +656,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_objects_dc):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_objects_dc, new_inpaint_mask=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -536,6 +677,23 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if self.inpaint_mask.numel() == (self.get_xyz.shape[0] - new_xyz.shape[0]):
+            if new_inpaint_mask is None:
+                new_inpaint_mask = torch.zeros((new_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+            else:
+                new_inpaint_mask = new_inpaint_mask.to(device=self.get_xyz.device, dtype=torch.bool)
+            self.inpaint_mask = torch.cat((self.inpaint_mask, new_inpaint_mask), dim=0)
+        else:
+            self.inpaint_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+
+        if self.height_constrained_mask.numel() == (self.get_xyz.shape[0] - new_xyz.shape[0]):
+            new_height_mask = torch.zeros((new_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+            new_height_values = torch.zeros((new_xyz.shape[0]), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
+            self.height_constrained_mask = torch.cat((self.height_constrained_mask, new_height_mask), dim=0)
+            self.height_constraint_values = torch.cat((self.height_constraint_values, new_height_values), dim=0)
+        else:
+            self.height_constrained_mask = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=torch.bool)
+            self.height_constraint_values = torch.zeros((self.get_xyz.shape[0]), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -557,8 +715,10 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_objects_dc = self._objects_dc[selected_pts_mask].repeat(N,1,1)
+        parent_inpaint_mask = self.get_inpaint_mask()[selected_pts_mask]
+        new_inpaint_mask = parent_inpaint_mask.repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_objects_dc)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_objects_dc, new_inpaint_mask)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -576,8 +736,9 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_objects_dc = self._objects_dc[selected_pts_mask]
+        new_inpaint_mask = self.get_inpaint_mask()[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_objects_dc)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_objects_dc, new_inpaint_mask)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

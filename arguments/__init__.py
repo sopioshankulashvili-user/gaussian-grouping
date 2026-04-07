@@ -55,6 +55,7 @@ class ModelParams(ParamGroup):
         self.random_init = False
         self.train_split = False
         self._object_path = "object_mask"
+        self.road_mask_path = "object_mask_road"
         self.num_classes = 200
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -94,6 +95,18 @@ class OptimizationParams(ParamGroup):
         self.reg3d_lambda_val = 2
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
+
+        self.flattened_road = False
+        self.road_constraint_every = 1
+        self.road_min_points = 128
+        self.road_height_loss_weight = 0.2
+        self.road_hole_loss_weight = 0.05
+        self.road_min_opacity = 0.05
+        self.road_height_blend = 1.0
+        self.remove_above_road = False
+        self.road_remove_every = 100
+        self.road_above_margin = 0.05
+        self.road_up_axis = "0,0,1"
 
         super().__init__(parser, "Optimization Parameters")
 

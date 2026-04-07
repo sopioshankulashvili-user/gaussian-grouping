@@ -1,0 +1,6 @@
+# ninja log v7
+1	5296	1773395344694941763	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-38/cuda_rasterizer/forward.o	de3325c6add7085b
+1	5529	1773395344694941763	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-38/cuda_rasterizer/backward.o	849785999128aad6
+1	12725	1773395344694941763	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-38/cuda_rasterizer/rasterizer_impl.o	cf4a5acd541cd5f3
+2	26566	1773395344694941763	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-38/ext.o	8a1c407865fb5644
+2	51842	1773395344694941763	/share/sopio/master_thesis/codebases/gaussian-grouping/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-38/rasterize_points.o	2302ddf8d7b8377b

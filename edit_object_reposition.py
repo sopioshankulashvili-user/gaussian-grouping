@@ -1,0 +1,351 @@
+# Copyright (C) 2023, Gaussian-Grouping
+# Gaussian-Grouping research group, https://github.com/lkeab/gaussian-grouping
+# All rights reserved.
+#
+# ------------------------------------------------------------------------
+# Modified from codes in Gaussian-Splatting
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+
+import json
+import os
+from argparse import ArgumentParser
+from os import makedirs
+from pathlib import Path
+from random import randint
+
+import cv2
+import lpips
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision
+from PIL import Image
+from tqdm import tqdm
+
+from arguments import ModelParams, OptimizationParams, PipelineParams, get_combined_args
+from edit_object_removal import points_inside_convex_hull
+from gaussian_renderer import GaussianModel, render
+from render import feature_to_rgb, visualize_obj
+from scene import Scene
+from utils.general_utils import safe_state
+from utils.loss_utils import ssim
+
+
+class PseudoGTSupervision:
+    def __init__(self, pseudo_gt_path):
+        self.enabled = bool(pseudo_gt_path)
+        self.pseudo_gt_path = Path(pseudo_gt_path) if self.enabled else None
+        self._cache = {}
+
+    def _load_image(self, image_name, image_height, image_width, device):
+        if not self.enabled:
+            return None
+        if image_name in self._cache:
+            cached = self._cache[image_name]
+            if cached is None:
+                return None
+            return cached.to(device)
+
+        image_file = self.pseudo_gt_path / f"{image_name}.png"
+        if not image_file.exists():
+            self._cache[image_name] = None
+            return None
+
+        image_np = np.array(Image.open(image_file).convert("RGB"), dtype=np.float32) / 255.0
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1)
+        if image_tensor.shape[1] != image_height or image_tensor.shape[2] != image_width:
+            image_tensor = F.interpolate(
+                image_tensor.unsqueeze(0),
+                size=(image_height, image_width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        self._cache[image_name] = image_tensor
+        return image_tensor.to(device)
+
+
+def apply_translation_to_selected_gaussians(gaussians, mask3d, translation):
+    translation_tensor = torch.tensor(translation, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
+    if translation_tensor.abs().sum().item() == 0:
+        return
+    with torch.no_grad():
+        gaussians._xyz.data[mask3d] = gaussians._xyz.data[mask3d] + translation_tensor
+
+
+def finetune_reposition(
+    opt,
+    model_path,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    classifier,
+    selected_obj_ids,
+    removal_thresh,
+    finetune_iteration,
+    translation,
+    pseudo_gt_path,
+    lambda_ssim=0.2,
+):
+    supervision = PseudoGTSupervision(pseudo_gt_path)
+
+    selected_obj_ids = torch.tensor(selected_obj_ids).cuda()
+    with torch.no_grad():
+        logits3d = classifier(gaussians._objects_dc.permute(2, 0, 1))
+        prob_obj3d = torch.softmax(logits3d, dim=0)
+        mask = prob_obj3d[selected_obj_ids, :, :] > removal_thresh
+        mask3d = mask.any(dim=0).squeeze()
+        mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(), mask3d, outlier_factor=1.0)
+        mask3d = torch.logical_or(mask3d, mask3d_convex)
+
+    apply_translation_to_selected_gaussians(gaussians, mask3d, translation)
+
+    mask3d_for_optimizer = mask3d.float()[:, None, None]
+    gaussians.finetune_setup(opt, mask3d_for_optimizer)
+
+    lpips_metric = lpips.LPIPS(net="vgg")
+    for param in lpips_metric.parameters():
+        param.requires_grad = False
+    lpips_metric.cuda()
+
+    progress_bar = tqdm(range(finetune_iteration), desc="Reposition finetune")
+    for i in range(finetune_iteration):
+        viewpoint_stack = views.copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+        render_pkg = render(viewpoint_cam, gaussians, pipeline, background)
+        rendering = render_pkg["render"]
+
+        pseudo_gt = supervision._load_image(
+            viewpoint_cam.image_name,
+            int(viewpoint_cam.image_height),
+            int(viewpoint_cam.image_width),
+            rendering.device,
+        )
+        if pseudo_gt is None:
+            pseudo_gt = viewpoint_cam.original_image.cuda()
+
+        l1 = torch.abs(rendering - pseudo_gt).mean()
+
+        rendering_lpips = F.interpolate(
+            rendering.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False
+        )
+        pseudo_gt_lpips = F.interpolate(
+            pseudo_gt.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False
+        )
+        lpips_loss = lpips_metric(rendering_lpips * 2 - 1, pseudo_gt_lpips * 2 - 1).mean()
+        ssim_loss = 1.0 - ssim(rendering.unsqueeze(0), pseudo_gt.unsqueeze(0))
+
+        loss = (0.8 - opt.lambda_dssim) * l1 + opt.lambda_dssim * lpips_loss + lambda_ssim * ssim_loss
+        loss.backward()
+
+        gaussians.optimizer.step()
+        gaussians.optimizer.zero_grad(set_to_none=True)
+
+        if i % 10 == 0:
+            progress_bar.set_postfix({"Loss": f"{loss:.7f}"})
+            progress_bar.update(10)
+    progress_bar.close()
+
+    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition/iteration_{iteration}")
+    gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+    return gaussians
+
+
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier):
+    render_path = os.path.join(model_path, name, "ours{}".format(iteration), "renders")
+    gts_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt")
+    colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_feature16")
+    gt_colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt_objects_color")
+    pred_obj_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_pred")
+    makedirs(render_path, exist_ok=True)
+    makedirs(gts_path, exist_ok=True)
+    makedirs(colormask_path, exist_ok=True)
+    makedirs(gt_colormask_path, exist_ok=True)
+    makedirs(pred_obj_path, exist_ok=True)
+
+    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        results = render(view, gaussians, pipeline, background)
+        rendering = results["render"]
+        rendering_obj = results["render_object"]
+        logits = classifier(rendering_obj)
+        pred_obj = torch.argmax(logits, dim=0)
+        pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))
+
+        gt_objects = view.objects
+        gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
+
+        rgb_mask = feature_to_rgb(rendering_obj)
+        Image.fromarray(rgb_mask).save(os.path.join(colormask_path, "{0:05d}".format(idx) + ".png"))
+        Image.fromarray(gt_rgb_mask).save(os.path.join(gt_colormask_path, "{0:05d}".format(idx) + ".png"))
+        Image.fromarray(pred_obj_mask).save(os.path.join(pred_obj_path, "{0:05d}".format(idx) + ".png"))
+        gt = view.original_image[0:3, :, :]
+        torchvision.utils.save_image(rendering, os.path.join(render_path, "{0:05d}".format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, "{0:05d}".format(idx) + ".png"))
+
+    out_path = os.path.join(render_path[:-8], "concat")
+    makedirs(out_path, exist_ok=True)
+    fourcc = cv2.VideoWriter.fourcc(*"DIVX")
+    size = (gt.shape[-1] * 5, gt.shape[-2])
+    fps = float(5) if "train" in out_path else float(1)
+    writer = cv2.VideoWriter(os.path.join(out_path, "result.mp4"), fourcc, fps, size)
+
+    for file_name in sorted(os.listdir(gts_path)):
+        gt = np.array(Image.open(os.path.join(gts_path, file_name)))
+        rgb = np.array(Image.open(os.path.join(render_path, file_name)))
+        gt_obj = np.array(Image.open(os.path.join(gt_colormask_path, file_name)))
+        render_obj = np.array(Image.open(os.path.join(colormask_path, file_name)))
+        pred_obj = np.array(Image.open(os.path.join(pred_obj_path, file_name)))
+
+        result = np.hstack([gt, rgb, gt_obj, pred_obj, render_obj]).astype("uint8")
+        Image.fromarray(result).save(os.path.join(out_path, file_name))
+        writer.write(result[:, :, ::-1])
+
+    writer.release()
+
+
+def reposition(
+    dataset: ModelParams,
+    iteration: int,
+    pipeline: PipelineParams,
+    skip_train: bool,
+    skip_test: bool,
+    opt: OptimizationParams,
+    select_obj_id,
+    removal_thresh: float,
+    finetune_iteration: int,
+    translation,
+    pseudo_gt_path,
+):
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    num_classes = dataset.num_classes
+    print("Num classes:", num_classes)
+    classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
+    classifier.cuda()
+    classifier.load_state_dict(
+        torch.load(os.path.join(dataset.model_path, "point_cloud", f"iteration_{scene.loaded_iter}", "classifier.pth"))
+    )
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    gaussians = finetune_reposition(
+        opt,
+        dataset.model_path,
+        scene.loaded_iter,
+        scene.getTrainCameras(),
+        gaussians,
+        pipeline,
+        background,
+        classifier,
+        select_obj_id,
+        removal_thresh,
+        finetune_iteration,
+        translation,
+        pseudo_gt_path,
+        lambda_ssim=getattr(opt, "reposition_lambda_ssim", 0.2),
+    )
+
+    dataset.object_path = "object_mask"
+    dataset.images = "images"
+    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition/iteration_{scene.loaded_iter}", shuffle=False)
+
+    with torch.no_grad():
+        if not skip_train:
+            render_set(
+                dataset.model_path,
+                "train",
+                scene.loaded_iter,
+                scene.getTrainCameras(),
+                gaussians,
+                pipeline,
+                background,
+                classifier,
+            )
+        if not skip_test:
+            render_set(
+                dataset.model_path,
+                "test",
+                scene.loaded_iter,
+                scene.getTestCameras(),
+                gaussians,
+                pipeline,
+                background,
+                classifier,
+            )
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description="Road damage reposition with pseudo-GT supervision")
+    model = ModelParams(parser, sentinel=True)
+    opt = OptimizationParams(parser)
+    pipeline = PipelineParams(parser)
+    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--skip_train", action="store_true")
+    parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+
+    parser.add_argument("--config_file", type=str, default="config/object_reposition/bear.json", help="Path to the configuration file")
+    parser.add_argument("--translation_dx", type=float, default=0.0, help="Translation in world x-axis")
+    parser.add_argument("--translation_dy", type=float, default=0.0, help="Translation in world y-axis")
+    parser.add_argument("--translation_dz", type=float, default=0.0, help="Translation in world z-axis")
+    parser.add_argument("--pseudo_gt_path", type=str, default="", help="Directory containing pseudo-GT images as <image_name>.png")
+
+    args = get_combined_args(parser)
+    print("Rendering " + args.model_path)
+
+    try:
+        with open(args.config_file, "r") as file:
+            config = json.load(file)
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{args.config_file}' not found.")
+        exit(1)
+    except json.JSONDecodeError as error:
+        print(f"Error: Failed to parse the JSON configuration file: {error}")
+        exit(1)
+
+    args.num_classes = config.get("num_classes", 200)
+    args.removal_thresh = config.get("removal_thresh", 0.3)
+    args.select_obj_id = config.get("select_obj_id", [34])
+    args.images = config.get("images", "images")
+    args.object_path = config.get("object_path", "object_mask")
+    args.resolution = config.get("r", 1)
+    args.lambda_dssim = config.get("lambda_dlpips", 0.5)
+    args.finetune_iteration = config.get("finetune_iteration", 10000)
+    args.reposition_lambda_ssim = config.get("reposition_lambda_ssim", 0.2)
+
+    cfg_translation = config.get("translation", None)
+    if cfg_translation is not None:
+        if not isinstance(cfg_translation, list) or len(cfg_translation) != 3:
+            raise ValueError("Config key 'translation' must be a list [dx, dy, dz].")
+        args.translation_dx = float(cfg_translation[0])
+        args.translation_dy = float(cfg_translation[1])
+        args.translation_dz = float(cfg_translation[2])
+    else:
+        args.translation_dx = config.get("translation_dx", args.translation_dx)
+        args.translation_dy = config.get("translation_dy", args.translation_dy)
+        args.translation_dz = config.get("translation_dz", args.translation_dz)
+
+    args.pseudo_gt_path = config.get("pseudo_gt_path", args.pseudo_gt_path)
+
+    translation = [args.translation_dx, args.translation_dy, args.translation_dz]
+    print(f"Using translation: {translation}")
+    print(f"Pseudo-GT path: {args.pseudo_gt_path}")
+
+    safe_state(args.quiet)
+
+    reposition(
+        model.extract(args),
+        args.iteration,
+        pipeline.extract(args),
+        args.skip_train,
+        args.skip_test,
+        opt.extract(args),
+        args.select_obj_id,
+        args.removal_thresh,
+        args.finetune_iteration,
+        translation,
+        args.pseudo_gt_path,
+    )

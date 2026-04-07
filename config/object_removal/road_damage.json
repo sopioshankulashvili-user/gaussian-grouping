@@ -1,0 +1,5 @@
+{
+    "num_classes": 2,
+    "removal_thresh": 0.4,
+    "select_obj_id" : [0]
+}

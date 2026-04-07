@@ -13,7 +13,7 @@ if len(sys.argv) != 4:
 dataset_name = sys.argv[1]
 
 image_dir = sys.argv[1]
-mask_dir = os.path.join(sys.argv[2],"Annotations")
+mask_dir = os.path.join(sys.argv[2],"")
 out_dir = sys.argv[3]
 out_mask_dir = os.path.join(sys.argv[3],"label")
 out_mask_vis_dir = os.path.join(sys.argv[3],"label_vis")
