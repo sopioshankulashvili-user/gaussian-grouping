@@ -6,7 +6,7 @@
     "reg3d_lambda_val": 2,
     "reg3d_max_points": 200000,
     "reg3d_sample_size": 1000,
-    "flattened_road": true,
+    "flattened_road": false,
     "road_mask_path" : "/data/sopio/small_city_50/25/object_mask_road",
-    "remove_above_road": true
+    "remove_above_road": false
 }

@@ -1,0 +1,13 @@
+{
+  "num_classes": 2,
+  "select_obj_id": [1],
+  "removal_thresh": 0.4,
+  "images": "/data/sopio/small_city_50/25/images",
+  "object_path": "/data/sopio/small_city_50/25/object_mask",
+  "r": 1,
+  "lambda_dlpips": 0.5,
+  "reposition_lambda_ssim": 0.2,
+  "finetune_iteration": 10000,
+  "translation": [-0.10, 0.0, 0.04],
+  "pseudo_gt_path": "/data/sopio/small_city_50/25/pseudo_gt_outputs"
+}

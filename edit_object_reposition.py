@@ -46,7 +46,7 @@ class PseudoGTSupervision:
                 return None
             return cached.to(device)
 
-        image_file = self.pseudo_gt_path / f"{image_name}.png"
+        image_file = self.pseudo_gt_path / f"{image_name}_pseudo_gt.png"
         if not image_file.exists():
             self._cache[image_name] = None
             return None

@@ -28,7 +28,6 @@ import torch.nn.functional as F
 
 from render import feature_to_rgb, visualize_obj
 from edit_object_removal import points_inside_convex_hull
-from stsim.TextureFeature import Stsim2
 
 import torch
 import torch.nn as nn
@@ -227,23 +226,7 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
 
         loss_ssim = 1.0 - ssim_val
 
-        """stsim logic"""
-
-        # stsim_metric = Stsim2.__new__(Stsim2)
-        # stsim2_total = 0
-        # for i in range(rendering_patches.shape[0]): # Loop through K*K patches
-        #     feat_A = stsim_metric.generate_feature_from_tensor(rendering_patches[i])
-        #     feat_B = stsim_metric.generate_feature_from_tensor(gt_patches[i])
-        #     stsim2_total += stsim_metric.compute_similarity(feat_A, feat_B)
-
-        # loss_stsim = 1.0 - (stsim2_total / rendering_patches.shape[0])
-
-        # feature_A = stsim_metric.generate_feature(rendering_patches)
-        # feature_B = stsim_metric.generate_feature(gt_patches)
-        # stsim_score = stsim_metric.compute_similarity(feature_A, feature_B)
-        # loss_stsim = 1.0 - stsim_score
-
-
+        
         """Style loss logic"""
         loss_style = STYLE(rendering_patches, gt_patches)
 
@@ -252,6 +235,8 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
             (lambda_ssim * loss_ssim) 
             # (0.1 * loss_style)
 
+
+        ### ROAD CONSTRAINTS ###
         # Apply road constraint losses
         loss_road_height = None
         loss_road_hole = None
@@ -312,17 +297,12 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
             pass
                 
         gaussians.optimizer.step()
+
+        #### ROAD CONSTRAINTS ####
         if road_constraints_active:
             gaussians.apply_height_constraint_to_gradients(blend=1.0)
             print("road constraint active:", road_constraints_active)
-        # with torch.no_grad():
-        #     is_inpainted = gaussians.get_inpaint_mask()
-        #     if is_inpainted.any():
-        #         print(f"Iteration {iteration}: Resetting {is_inpainted.sum().item()} inpainted Gaussians")
-        #         gaussians._scaling[is_inpainted, 2] = -7.0
-        #         inpainted_scales = gaussians._scaling[is_inpainted]
-        #         gaussians._scaling[is_inpainted] = torch.clamp(inpainted_scales, max=-4.6)
-        #         gaussians._opacity[is_inpainted] = 10.0
+
         gaussians.optimizer.zero_grad(set_to_none = True)
 
         if iteration % 10 == 0:
