@@ -31,6 +31,13 @@ from utils.general_utils import safe_state
 from utils.loss_utils import ssim
 
 
+def safe_torch_load(path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class PseudoGTSupervision:
     def __init__(self, pseudo_gt_path):
         self.enabled = bool(pseudo_gt_path)
@@ -73,6 +80,123 @@ def apply_translation_to_selected_gaussians(gaussians, mask3d, translation):
         gaussians._xyz.data[mask3d] = gaussians._xyz.data[mask3d] + translation_tensor
 
 
+def duplicate_and_translate_selected_gaussians(gaussians, mask3d, translation):
+    """
+    Keep the original gaussians in place and create a translated duplicate copy.
+
+    Returns:
+        train_mask_expanded: Bool mask of length N+M for optimization.
+            Marks original selected gaussians and translated duplicates.
+        translated_only_mask: Bool mask of length N+M marking only translated duplicates.
+    """
+    translation_tensor = torch.tensor(translation, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
+    n_original = gaussians._xyz.shape[0]
+    n_selected = int(mask3d.sum().item())
+
+    if translation_tensor.abs().sum().item() == 0 or n_selected == 0:
+        translated_only_mask = torch.zeros_like(mask3d, dtype=torch.bool)
+        return mask3d, translated_only_mask
+
+    with torch.no_grad():
+        xyz_new = gaussians._xyz[mask3d].detach().clone() + translation_tensor
+        features_dc_new = gaussians._features_dc[mask3d].detach().clone()
+        features_rest_new = gaussians._features_rest[mask3d].detach().clone()
+        opacity_new = gaussians._opacity[mask3d].detach().clone()
+        scaling_new = gaussians._scaling[mask3d].detach().clone()
+        rotation_new = gaussians._rotation[mask3d].detach().clone()
+        objects_dc_new = gaussians._objects_dc[mask3d].detach().clone()
+
+        gaussians._xyz = torch.nn.Parameter(torch.cat([gaussians._xyz.detach(), xyz_new], dim=0).requires_grad_(True))
+        gaussians._features_dc = torch.nn.Parameter(
+            torch.cat([gaussians._features_dc.detach(), features_dc_new], dim=0).requires_grad_(True)
+        )
+        gaussians._features_rest = torch.nn.Parameter(
+            torch.cat([gaussians._features_rest.detach(), features_rest_new], dim=0).requires_grad_(True)
+        )
+        gaussians._opacity = torch.nn.Parameter(torch.cat([gaussians._opacity.detach(), opacity_new], dim=0).requires_grad_(True))
+        gaussians._scaling = torch.nn.Parameter(torch.cat([gaussians._scaling.detach(), scaling_new], dim=0).requires_grad_(True))
+        gaussians._rotation = torch.nn.Parameter(torch.cat([gaussians._rotation.detach(), rotation_new], dim=0).requires_grad_(True))
+        gaussians._objects_dc = torch.nn.Parameter(torch.cat([gaussians._objects_dc.detach(), objects_dc_new], dim=0).requires_grad_(True))
+
+    train_mask_expanded = torch.zeros((n_original + n_selected), device=mask3d.device, dtype=torch.bool)
+    train_mask_expanded[:n_original] = mask3d
+    train_mask_expanded[n_original:] = True
+
+    translated_only_mask = torch.zeros((n_original + n_selected), device=mask3d.device, dtype=torch.bool)
+    translated_only_mask[n_original:] = True
+
+    return train_mask_expanded, translated_only_mask
+
+
+def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0.05, blend_radius=0.1):
+    """
+    Reduce opacity of gaussians in the destination area to create space for blending.
+    
+    Args:
+        gaussians: GaussianModel instance
+        translated_mask3d: Boolean mask of gaussians that were translated
+        target_opacity: Target opacity value for gaussians in destination (default 0.05, very transparent)
+        blend_radius: Kept for backward compatibility; convex-hull based blending no longer uses a radius search
+    """
+    with torch.no_grad():
+        translated_positions = gaussians._xyz.data[translated_mask3d]
+        all_positions = gaussians._xyz.data
+
+        if translated_positions.shape[0] == 0:
+            return
+
+        # Build a convex hull around the translated gaussians and affect the
+        # other gaussians that fall inside this destination region.
+        from scipy.spatial import Delaunay
+
+        translated_points = translated_positions.detach().cpu().numpy()
+        if translated_points.shape[0] < 4:
+            # A 3D convex hull needs at least four non-coplanar points.
+            # Fall back to affecting the translated gaussians themselves only.
+            destination_mask = translated_mask3d.clone()
+        else:
+            try:
+                hull = Delaunay(translated_points)
+                inside_mask = torch.from_numpy(
+                    hull.find_simplex(all_positions.detach().cpu().numpy()) >= 0
+                ).to(device=translated_mask3d.device)
+                destination_mask = inside_mask & (~translated_mask3d)
+            except Exception:
+                # If the hull is degenerate, fall back to a conservative mask.
+                destination_mask = translated_mask3d.clone()
+
+        if destination_mask.sum().item() == 0:
+            return
+
+        from utils.general_utils import inverse_sigmoid
+        target_opacity_internal = inverse_sigmoid(torch.tensor(target_opacity, device=gaussians._opacity.device))
+
+        gaussians._opacity.data[destination_mask] = target_opacity_internal
+        print(f"Reduced opacity for {destination_mask.sum().item()} gaussians in destination area")
+
+
+def reduce_opacity_simple(gaussians, mask, target_opacity=0.05):
+    """
+    Directly reduce opacity of gaussians with a given mask.
+    
+    Args:
+        gaussians: GaussianModel instance
+        mask: Boolean mask of gaussians to affect
+        target_opacity: Target opacity value (default 0.05, very transparent)
+    """
+    with torch.no_grad():
+        from utils.general_utils import inverse_sigmoid
+        if mask.sum().item() > 0:
+            # Convert target opacity to internal representation
+            target_opacity_internal = inverse_sigmoid(torch.tensor(target_opacity, device=gaussians._opacity.device))
+            gaussians._opacity.data[mask] = torch.clamp(
+                gaussians._opacity.data[mask] + target_opacity_internal,
+                min=inverse_sigmoid(torch.tensor(0.001, device=gaussians._opacity.device)),
+                max=inverse_sigmoid(torch.tensor(0.999, device=gaussians._opacity.device))
+            )
+            print(f"Reduced opacity for {mask.sum().item()} gaussians")
+
+
 def finetune_reposition(
     opt,
     model_path,
@@ -88,6 +212,10 @@ def finetune_reposition(
     translation,
     pseudo_gt_path,
     lambda_ssim=0.2,
+    enable_opacity_blending=False,
+    opacity_blend_target=0.05,
+    opacity_blend_radius=0.1,
+    keep_original_gaussians=False,
 ):
     supervision = PseudoGTSupervision(pseudo_gt_path)
 
@@ -100,9 +228,25 @@ def finetune_reposition(
         mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(), mask3d, outlier_factor=1.0)
         mask3d = torch.logical_or(mask3d, mask3d_convex)
 
-    apply_translation_to_selected_gaussians(gaussians, mask3d, translation)
+    translated_mask_for_blending = mask3d
+    if keep_original_gaussians:
+        mask3d_for_optimizer, translated_mask_for_blending = duplicate_and_translate_selected_gaussians(
+            gaussians, mask3d, translation
+        )
+    else:
+        apply_translation_to_selected_gaussians(gaussians, mask3d, translation)
+        mask3d_for_optimizer = mask3d
+    
+    # Optionally reduce opacity in destination area for better blending
+    if enable_opacity_blending:
+        reduce_opacity_in_destination(
+            gaussians, 
+            translated_mask_for_blending,
+            target_opacity=opacity_blend_target,
+            blend_radius=opacity_blend_radius
+        )
 
-    mask3d_for_optimizer = mask3d.float()[:, None, None]
+    mask3d_for_optimizer = mask3d_for_optimizer.float()[:, None, None]
     gaussians.finetune_setup(opt, mask3d_for_optimizer)
 
     lpips_metric = lpips.LPIPS(net="vgg")
@@ -218,6 +362,10 @@ def reposition(
     finetune_iteration: int,
     translation,
     pseudo_gt_path,
+    enable_opacity_blending: bool = False,
+    opacity_blend_target: float = 0.05,
+    opacity_blend_radius: float = 0.1,
+    keep_original_gaussians: bool = False,
 ):
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -226,7 +374,7 @@ def reposition(
     classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
     classifier.cuda()
     classifier.load_state_dict(
-        torch.load(os.path.join(dataset.model_path, "point_cloud", f"iteration_{scene.loaded_iter}", "classifier.pth"))
+        safe_torch_load(os.path.join(dataset.model_path, "point_cloud", f"iteration_{scene.loaded_iter}", "classifier.pth"))
     )
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -246,6 +394,10 @@ def reposition(
         translation,
         pseudo_gt_path,
         lambda_ssim=getattr(opt, "reposition_lambda_ssim", 0.2),
+        enable_opacity_blending=enable_opacity_blending,
+        opacity_blend_target=opacity_blend_target,
+        opacity_blend_radius=opacity_blend_radius,
+        keep_original_gaussians=keep_original_gaussians,
     )
 
     dataset.object_path = "object_mask"
@@ -292,6 +444,10 @@ if __name__ == "__main__":
     parser.add_argument("--translation_dy", type=float, default=0.0, help="Translation in world y-axis")
     parser.add_argument("--translation_dz", type=float, default=0.0, help="Translation in world z-axis")
     parser.add_argument("--pseudo_gt_path", type=str, default="", help="Directory containing pseudo-GT images as <image_name>.png")
+    parser.add_argument("--enable_opacity_blending", action="store_true", help="Enable opacity reduction in destination area for better blending")
+    parser.add_argument("--opacity_blend_target", type=float, default=0.05, help="Target opacity for gaussians in destination area")
+    parser.add_argument("--opacity_blend_radius", type=float, default=0.1, help="Radius around translated gaussians to affect for blending")
+    parser.add_argument("--keep_original_gaussians", action="store_true", help="Keep the original gaussians in place and duplicate them at the translated location")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -330,6 +486,11 @@ if __name__ == "__main__":
 
     args.pseudo_gt_path = config.get("pseudo_gt_path", args.pseudo_gt_path)
 
+    args.enable_opacity_blending = config.get("enable_opacity_blending", args.enable_opacity_blending)
+    args.opacity_blend_target = config.get("opacity_blend_target", args.opacity_blend_target)
+    args.opacity_blend_radius = config.get("opacity_blend_radius", args.opacity_blend_radius)
+    args.keep_original_gaussians = config.get("keep_original_gaussians", args.keep_original_gaussians)
+
     translation = [args.translation_dx, args.translation_dy, args.translation_dz]
     print(f"Using translation: {translation}")
     print(f"Pseudo-GT path: {args.pseudo_gt_path}")
@@ -348,4 +509,8 @@ if __name__ == "__main__":
         args.finetune_iteration,
         translation,
         args.pseudo_gt_path,
+        enable_opacity_blending=args.enable_opacity_blending,
+        opacity_blend_target=args.opacity_blend_target,
+        opacity_blend_radius=args.opacity_blend_radius,
+        keep_original_gaussians=args.keep_original_gaussians,
     )

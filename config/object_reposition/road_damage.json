@@ -7,7 +7,9 @@
   "r": 1,
   "lambda_dlpips": 0.5,
   "reposition_lambda_ssim": 0.2,
-  "finetune_iteration": 10000,
+  "finetune_iteration": 30000,
   "translation": [-0.10, 0.0, 0.04],
-  "pseudo_gt_path": "/data/sopio/small_city_50/25/pseudo_gt_outputs"
+  "pseudo_gt_path": "/data/sopio/small_city_50/25/pseudo_gt_outputs",
+  "enable_opacity_blending": true,
+  "keep_original_gaussians": true
 }
