@@ -282,12 +282,12 @@ def finetune_reposition(
 
     # Remove gaussians that already occupy the destination region before
     # finetune_setup(), because pruning requires an initialized optimizer.
-    removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
-    if removed_mask is not None:
-        keep_mask = ~removed_mask
-        mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
-        target_anchor_mask = target_anchor_mask[keep_mask]
-        source_neighborhood_mask = source_neighborhood_mask[keep_mask]
+    # removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
+    # if removed_mask is not None:
+    #     keep_mask = ~removed_mask
+    #     mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
+    #     target_anchor_mask = target_anchor_mask[keep_mask]
+    #     source_neighborhood_mask = source_neighborhood_mask[keep_mask]
 
     target_neighborhood_mask = points_inside_convex_hull(
         gaussians._xyz.detach(), target_anchor_mask, outlier_factor=1.0
@@ -349,7 +349,14 @@ def finetune_reposition(
             progress_bar.update(10)
     progress_bar.close()
 
-    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition/iteration_{iteration}")
+    removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
+    if removed_mask is not None:
+        keep_mask = ~removed_mask
+        mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
+        target_anchor_mask = target_anchor_mask[keep_mask]
+        source_neighborhood_mask = source_neighborhood_mask[keep_mask]
+
+    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition_copy/iteration_{iteration}")
     gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
     return gaussians
 
@@ -458,7 +465,7 @@ def reposition(
 
     dataset.object_path = "object_mask"
     dataset.images = "images"
-    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition/iteration_{scene.loaded_iter}", shuffle=False)
+    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition_copy/iteration_{scene.loaded_iter}", shuffle=False)
 
     with torch.no_grad():
         if not skip_train:

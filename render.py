@@ -73,17 +73,28 @@ def visualize_obj(objects):
     return rgb_mask
 
 
+def confidence_to_heatmap(confidence_map):
+    confidence_np = confidence_map.detach().cpu().numpy()
+    confidence_np = np.clip(confidence_np, 0.0, 1.0)
+    confidence_uint8 = (confidence_np * 255.0).astype(np.uint8)
+    heatmap_bgr = cv2.applyColorMap(confidence_uint8, cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+    return heatmap_rgb
+
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     colormask_path = os.path.join(model_path, name, "ours_{}".format(iteration), "objects_feature16")
     gt_colormask_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt_objects_color")
     pred_obj_path = os.path.join(model_path, name, "ours_{}".format(iteration), "objects_pred")
+    confidence_heatmap_path = os.path.join(model_path, name, "ours_{}".format(iteration), "objects_confidence_heatmap")
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(colormask_path, exist_ok=True)
     makedirs(gt_colormask_path, exist_ok=True)
     makedirs(pred_obj_path, exist_ok=True)
+    makedirs(confidence_heatmap_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         results = render(view, gaussians, pipeline, background)
@@ -91,8 +102,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering_obj = results["render_object"]
         
         logits = classifier(rendering_obj)
-        pred_obj = torch.argmax(logits,dim=0)
+        probs = torch.softmax(logits, dim=0)
+        confidence_map, pred_obj = torch.max(probs, dim=0)
         pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))
+        confidence_heatmap = confidence_to_heatmap(confidence_map)
         
 
         gt_objects = view.objects
@@ -102,6 +115,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         Image.fromarray(rgb_mask).save(os.path.join(colormask_path, '{0:05d}'.format(idx) + ".png"))
         Image.fromarray(gt_rgb_mask).save(os.path.join(gt_colormask_path, '{0:05d}'.format(idx) + ".png"))
         Image.fromarray(pred_obj_mask).save(os.path.join(pred_obj_path, '{0:05d}'.format(idx) + ".png"))
+        Image.fromarray(confidence_heatmap).save(os.path.join(confidence_heatmap_path, '{0:05d}'.format(idx) + ".png"))
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -109,7 +123,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     out_path = os.path.join(render_path[:-8],'concat')
     makedirs(out_path,exist_ok=True)
     fourcc = cv2.VideoWriter.fourcc(*'DIVX') 
-    size = (gt.shape[-1]*5,gt.shape[-2])
+    size = (gt.shape[-1]*6,gt.shape[-2])
     fps = float(5) if 'train' in out_path else float(1)
     writer = cv2.VideoWriter(os.path.join(out_path,'result.mp4'), fourcc, fps, size)
 
@@ -119,8 +133,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         gt_obj = np.array(Image.open(os.path.join(gt_colormask_path,file_name)))
         render_obj = np.array(Image.open(os.path.join(colormask_path,file_name)))
         pred_obj = np.array(Image.open(os.path.join(pred_obj_path,file_name)))
+        conf_heat = np.array(Image.open(os.path.join(confidence_heatmap_path,file_name)))
 
-        result = np.hstack([gt,rgb,gt_obj,pred_obj,render_obj])
+        result = np.hstack([gt,rgb,gt_obj,pred_obj,render_obj,conf_heat])
         result = result.astype('uint8')
 
         Image.fromarray(result).save(os.path.join(out_path,file_name))

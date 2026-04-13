@@ -120,7 +120,14 @@ def build_road_class_mask(gaussians, classifier, road_class_id=1, probability_th
     return road_mask
 
 
-def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 1.0), candidate_mask=None):
+def prune_gaussians_above_road_plane(
+    gaussians,
+    margin=0.05,
+    up_axis=(0.0, 0.0, 1.0),
+    below_margin=None,
+    candidate_mask=None,
+    protect_mask=None,
+):
     if gaussians.plane_normal is None or gaussians.plane_centroid is None:
         return 0
 
@@ -131,20 +138,27 @@ def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 
     plane_normal = torch.from_numpy(gaussians.plane_normal).float().to(device=xyz.device)
     plane_centroid = torch.from_numpy(gaussians.plane_centroid).float().to(device=xyz.device)
 
-    up_axis_tensor = torch.tensor(up_axis, dtype=torch.float32, device=xyz.device)
-    up_norm = torch.norm(up_axis_tensor)
-    if up_norm > 0:
-        up_axis_tensor = up_axis_tensor / up_norm
-        if torch.dot(plane_normal, up_axis_tensor) < 0:
-            plane_normal = -plane_normal
+    # up_axis_tensor = torch.tensor(up_axis, dtype=torch.float32, device=xyz.device)
+    # up_norm = torch.norm(up_axis_tensor)
+    # if up_norm > 0:
+    #     up_axis_tensor = up_axis_tensor / up_norm
+    #     if torch.dot(plane_normal, up_axis_tensor) < 0:
+    #         plane_normal = -plane_normal
 
+    above_margin = float(margin)
+    below_margin = float(above_margin if below_margin is None else below_margin)
     signed_distance = ((xyz - plane_centroid.unsqueeze(0)) * plane_normal.unsqueeze(0)).sum(dim=1)
-    prune_mask = signed_distance > float(margin)
+    prune_mask = (signed_distance > above_margin) | (signed_distance < -below_margin)
 
     if candidate_mask is not None:
         if candidate_mask.numel() != prune_mask.numel():
             return 0
         prune_mask = prune_mask & candidate_mask.to(device=prune_mask.device, dtype=torch.bool)
+
+    if protect_mask is not None:
+        if protect_mask.numel() != prune_mask.numel():
+            return 0
+        prune_mask = prune_mask & (~protect_mask.to(device=prune_mask.device, dtype=torch.bool))
 
     if not prune_mask.any():
         return 0
@@ -152,6 +166,24 @@ def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 
     prune_count = int(prune_mask.sum().item())
     gaussians.prune_points(prune_mask)
     return prune_count
+
+
+def trim_above_plane_from_mask(gaussians, protect_mask, above_margin=0.0):
+    if protect_mask is None:
+        return None
+    if gaussians.plane_normal is None or gaussians.plane_centroid is None:
+        return protect_mask
+
+    xyz = gaussians.get_xyz
+    if xyz.numel() == 0 or protect_mask.numel() != xyz.shape[0]:
+        return protect_mask
+
+    plane_normal = torch.from_numpy(gaussians.plane_normal).float().to(device=xyz.device)
+    plane_centroid = torch.from_numpy(gaussians.plane_centroid).float().to(device=xyz.device)
+    signed_distance = ((xyz - plane_centroid.unsqueeze(0)) * plane_normal.unsqueeze(0)).sum(dim=1)
+
+    safe_mask = signed_distance <= float(above_margin)
+    return protect_mask.to(device=xyz.device, dtype=torch.bool) & safe_mask
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
@@ -226,6 +258,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if road_constraints_active and iteration % max(1, opt.road_constraint_every) == 0:
             if road_use_class_mask:
+                # print(f"[RoadConstraint] Using classifier-based road mask with class ID {opt.road_class_id} and probability threshold {opt.road_class_prob_threshold}.")
                 road_gaussian_mask = build_road_class_mask(
                     gaussians,
                     classifier,
@@ -242,9 +275,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 constraint_values, plane_info = create_road_height_constraint(
                     gaussians, 
                     road_gaussian_mask, 
-                    # height_value=0.0, #if we want to hardcode height
+                    height_value=1.4, #if we want to hardcode height
                     method='fit_plane_axis_agnostic'
                 )
+
+                if gaussians.plane_normal is not None and gaussians.plane_centroid is not None:
+                        n = gaussians.plane_normal.astype(np.float64)   # [a, b, c]
+                        c0 = gaussians.plane_centroid.astype(np.float64)
+                        d = -float(np.dot(n, c0))
+                        cam_name = getattr(viewpoint_cam, "image_name", "unknown_view")
+                        print(
+                            f"[Iter {iteration:06d}] [View {cam_name}] "
+                            f"Plane: {n[0]:+.6f}x {n[1]:+.6f}y {n[2]:+.6f}z {d:+.6f} = 0"
+                        )
             else:
                 gaussians.clear_height_constraint()
                 if road_gaussian_mask is None:
@@ -329,6 +372,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+
+                if road_constraints_active and opt.remove_above_road and iteration % max(1, opt.road_remove_every) == 0:
+                    prune_protect_mask = None
+                    if gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0]:
+                        prune_protect_mask = gaussians.height_constrained_mask
+
+                    if road_use_class_mask:
+                        class_protect_mask = build_road_class_mask(
+                            gaussians,
+                            classifier,
+                            road_class_id=opt.road_class_id,
+                            probability_threshold=opt.road_class_prob_threshold,
+                        )
+                        if class_protect_mask is not None:
+                            prune_protect_mask = class_protect_mask if prune_protect_mask is None else (prune_protect_mask | class_protect_mask)
+
+                    prune_protect_mask = trim_above_plane_from_mask(
+                        gaussians,
+                        prune_protect_mask,
+                        above_margin=opt.road_above_margin,
+                    )
+
+                    pruned_count = prune_gaussians_above_road_plane(
+                        gaussians,
+                        margin=opt.road_above_margin,
+                        below_margin=getattr(opt, "road_below_margin", opt.road_above_margin),
+                        up_axis=opt.road_up_axis,
+                        protect_mask=prune_protect_mask,
+                    )
+                    if pruned_count > 0:
+                        print(
+                            f"[RoadConstraint] Pruned {pruned_count} off-plane gaussians "
+                            f"(above={opt.road_above_margin:.4f}, below={getattr(opt, 'road_below_margin', opt.road_above_margin):.4f})."
+                        )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -336,7 +413,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                if road_constraints_active:
+                # for every thousand iterations
+                if road_constraints_active and iteration % 1000 == 0:
                     gaussians.apply_height_constraint_to_gradients(blend=opt.road_height_blend)
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 cls_optimizer.step()
@@ -348,25 +426,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if road_constraints_active and opt.remove_above_road:
         with torch.no_grad():
-            prune_candidate_mask = None
+            prune_protect_mask = None
+            if gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0]:
+                prune_protect_mask = gaussians.height_constrained_mask
+
             if road_use_class_mask:
-                prune_candidate_mask = build_road_class_mask(
+                class_protect_mask = build_road_class_mask(
                     gaussians,
                     classifier,
                     road_class_id=opt.road_class_id,
                     probability_threshold=opt.road_class_prob_threshold,
                 )
-            elif gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0]:
-                prune_candidate_mask = gaussians.height_constrained_mask
+                if class_protect_mask is not None:
+                    prune_protect_mask = class_protect_mask if prune_protect_mask is None else (prune_protect_mask | class_protect_mask)
+
+            prune_protect_mask = trim_above_plane_from_mask(
+                gaussians,
+                prune_protect_mask,
+                above_margin=opt.road_above_margin,
+            )
 
             pruned_count = prune_gaussians_above_road_plane(
                 gaussians,
                 margin=opt.road_above_margin,
+                below_margin=getattr(opt, "road_below_margin", opt.road_above_margin),
                 up_axis=opt.road_up_axis,
-                candidate_mask=prune_candidate_mask,
+                protect_mask=prune_protect_mask,
             )
             if pruned_count > 0:
-                print(f"[RoadConstraint] Post-training prune removed {pruned_count} gaussians above road plane (margin={opt.road_above_margin:.4f}).")
+                print(
+                    f"[RoadConstraint] Post-training prune removed {pruned_count} off-plane gaussians "
+                    f"(above={opt.road_above_margin:.4f}, below={getattr(opt, 'road_below_margin', opt.road_above_margin):.4f})."
+                )
             else:
                 print("[RoadConstraint] Post-training prune removed 0 gaussians.")
 
@@ -479,6 +570,7 @@ if __name__ == "__main__":
     args.remove_above_road = config.get("remove_above_road", args.remove_above_road)
     args.road_remove_every = config.get("road_remove_every", args.road_remove_every)
     args.road_above_margin = config.get("road_above_margin", args.road_above_margin)
+    args.road_below_margin = config.get("road_below_margin", getattr(args, "road_below_margin", args.road_above_margin))
     args.road_mask_source = config.get("road_mask_source", args.road_mask_source)
     args.road_class_id = config.get("road_class_id", args.road_class_id)
     args.road_class_prob_threshold = config.get("road_class_prob_threshold", args.road_class_prob_threshold)

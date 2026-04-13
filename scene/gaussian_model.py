@@ -156,6 +156,7 @@ class GaussianModel:
                 # Apply correction along plane normal
                 correction = distance_error.unsqueeze(1) * plane_normal.unsqueeze(0)
                 blended_correction = blend * correction
+                print("[HeightConstraint] Applying axis-agnostic height constraint with blend factor {:.4f}. Max correction: {:.6f}".format(blend, blended_correction.abs().max().item()))
                 
                 self._xyz.data[constrained_mask] -= blended_correction
             else:

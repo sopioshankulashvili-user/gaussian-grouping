@@ -8,6 +8,99 @@ from scipy.spatial import KDTree
 from scipy.optimize import least_squares
 
 
+def _fit_plane_from_points_numpy(points):
+    """Fit a plane to 3D points using covariance eigen-analysis.
+
+    Returns:
+        centroid (np.ndarray), normal (np.ndarray), d (float)
+    """
+    centroid = points.mean(axis=0)
+    centered_points = points - centroid
+    cov_matrix = (centered_points.T @ centered_points) / max(len(points), 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    normal = eigenvectors[:, np.argmin(eigenvalues)]
+    normal_norm = np.linalg.norm(normal)
+    if normal_norm < 1e-12:
+        normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        normal = normal / normal_norm
+    d = -float(np.dot(normal, centroid))
+    return centroid, normal, d
+
+
+def fit_plane_to_points_ransac(xyz, mask, return_full_info=False, n_iters=256, distance_threshold=0.02, min_inliers=16, random_state=0):
+    """
+    Robustly fit a plane to masked points using a simple RANSAC loop.
+
+    Args:
+        xyz: Tensor/array of shape (N, 3)
+        mask: Boolean mask selecting candidate road points
+        return_full_info: If True, return (centroid, normal, d)
+        n_iters: Number of RANSAC iterations
+        distance_threshold: Inlier threshold measured as absolute distance to plane
+        min_inliers: Minimum inliers needed to accept a candidate plane
+        random_state: Seed for deterministic sampling
+
+    Returns:
+        Same return shape as fit_plane_to_points_axis_agnostic() when successful.
+    """
+    if not mask.any():
+        if return_full_info:
+            return np.array([0, 0, 0]), np.array([0, 0, 1]), 0
+        return {
+            'centroid': np.array([0, 0, 0]),
+            'normal': np.array([0, 0, 1]),
+            'd': 0,
+        }
+
+    points = xyz[mask].detach().cpu().numpy() if isinstance(xyz, torch.Tensor) else np.asarray(xyz[mask])
+    if points.shape[0] < 3:
+        return fit_plane_to_points_axis_agnostic(xyz, mask, return_full_info=return_full_info)
+
+    rng = np.random.default_rng(random_state)
+    best_inlier_count = -1
+    best_inlier_mask = None
+    best_model = None
+
+    # Degenerate / tiny sets are handled by the fallback below.
+    for _ in range(int(n_iters)):
+        sample_idx = rng.choice(points.shape[0], size=3, replace=False)
+        p1, p2, p3 = points[sample_idx]
+        normal = np.cross(p2 - p1, p3 - p1)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-10:
+            continue
+        normal = normal / norm
+        d = -float(np.dot(normal, p1))
+
+        distances = np.abs(points @ normal + d)
+        inlier_mask = distances < float(distance_threshold)
+        inlier_count = int(inlier_mask.sum())
+        if inlier_count > best_inlier_count:
+            best_inlier_count = inlier_count
+            best_inlier_mask = inlier_mask
+            best_model = (normal, d)
+
+    if best_model is None or best_inlier_mask is None or best_inlier_count < max(3, int(min_inliers)):
+        return fit_plane_to_points_axis_agnostic(xyz, mask, return_full_info=return_full_info)
+
+    inlier_points = points[best_inlier_mask]
+    centroid, normal, d = _fit_plane_from_points_numpy(inlier_points)
+
+    # Keep orientation stable.
+    if best_model is not None and np.dot(normal, best_model[0]) < 0:
+        normal = -normal
+        d = -d
+
+    if return_full_info:
+        return centroid, normal, d
+    return {
+        'centroid': centroid,
+        'normal': normal,
+        'd': d,
+    }
+
+
 def detect_flat_surface_height(xyz, mask, outlier_percentile=5, verbose=False):
     """
     Detect the height of a flat surface by analyzing Z-coordinates of points in the masked region.
@@ -192,10 +285,13 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
     """
     xyz = gaussians.get_xyz
     
-    if method == 'fit_plane_axis_agnostic':
+    if method in ('fit_plane_axis_agnostic', 'ransac'):
         # Compute plane and project points onto normal direction
         if plane_info is None:
-            plane_info = fit_plane_to_points_axis_agnostic(xyz, mask, return_full_info=False)
+            if method == 'ransac':
+                plane_info = fit_plane_to_points_ransac(xyz, mask, return_full_info=False)
+            else:
+                plane_info = fit_plane_to_points_axis_agnostic(xyz, mask, return_full_info=False)
 
         if height_value is None:
             constraint_values = compute_constraint_values_along_normal(xyz, plane_info, mask).detach()
@@ -205,7 +301,8 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
             constraint_values[mask_t] = float(height_value)
             constraint_values = constraint_values.detach()
         
-        print(f"\n[RoadConstraint] Axis-Agnostic Plane Fitting:")
+        method_name = "RANSAC Plane Fitting" if method == 'ransac' else "Axis-Agnostic Plane Fitting"
+        print(f"\n[RoadConstraint] {method_name}:")
         print(f"  Plane normal: [{plane_info['normal'][0]:.4f}, {plane_info['normal'][1]:.4f}, {plane_info['normal'][2]:.4f}]")
         print(f"  Plane centroid: [{plane_info['centroid'][0]:.4f}, {plane_info['centroid'][1]:.4f}, {plane_info['centroid'][2]:.4f}]")
         print(f"  Constrained Gaussians: {mask.sum().item()}")
@@ -224,6 +321,10 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
             height_value = xyz[mask, 2].median().item()
     elif method == 'fit_plane':
         height_value = fit_plane_to_points(xyz, mask, return_plane_params=False)
+    elif method == 'ransac':
+        centroid, normal, d = fit_plane_to_points_ransac(xyz, mask, return_full_info=True)
+        plane_info = {'centroid': centroid, 'normal': normal, 'd': d}
+        height_value = compute_constraint_values_along_normal(xyz, plane_info, mask).detach()
     else:
         raise ValueError(f"Unknown method: {method}")
     

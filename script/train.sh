@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --time=1-0
 #SBATCH --partition=3090
-#SBATCH -J nonconstr
+#SBATCH -J 1.4hieght
 
 
 echo "Starting job ${SLURM_JOB_ID} on ${SLURMD_NODENAME}"
@@ -43,7 +43,7 @@ conda activate gaussian_grouping
 # python visualize_pc_axes.py /share/sopio/master_thesis/codebases/gaussian-grouping/output/small_city_50/25/input.ply
 
 # Gaussian Grouping training
-python train.py    -s /data/sopio/small_city_50/25 -r 1  -m output/small_city_50/25_2_objects --config_file config/gaussian_dataset/train.json --iteration 7000
+python train.py    -s /data/sopio/small_city_50/25 -r 1  -m output/small_city_50/25 --config_file config/gaussian_dataset/train.json --iteration 7000
 
 # Segmentation rendering using trained model
-python render.py -m output/small_city_50/25_2_objects --num_classes 3
+python render.py -m output/small_city_50/25 --num_classes 3

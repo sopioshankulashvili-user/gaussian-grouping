@@ -97,19 +97,20 @@ class OptimizationParams(ParamGroup):
         self.reg3d_sample_size = 1000
 
         self.flattened_road = False
-        self.road_constraint_every = 100
+        self.road_constraint_every = 1
         self.road_min_points = 128
         self.road_height_loss_weight = 0.2
         self.road_hole_loss_weight = 0.05
         self.road_min_opacity = 0.05
         self.road_height_blend = 1.0
         self.remove_above_road = False
-        self.road_remove_every = 100
+        self.road_remove_every = 7000
         self.road_above_margin = 0.05
+        self.road_below_margin = 0.05
         self.road_up_axis = "0,0,1"
         self.road_mask_source = "class"
         self.road_class_id = 1
-        self.road_class_prob_threshold = 0.5
+        self.road_class_prob_threshold = 0.4
 
         super().__init__(parser, "Optimization Parameters")
 
