@@ -104,7 +104,23 @@ class RoadConstraintManager:
         return full_mask
 
 
-def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 1.0)):
+def build_road_class_mask(gaussians, classifier, road_class_id=1, probability_threshold=0.5, visible_mask=None):
+    with torch.no_grad():
+        logits = classifier(gaussians._objects_dc.permute(2, 0, 1))
+        probs = torch.softmax(logits, dim=0)
+
+    if road_class_id < 0 or road_class_id >= probs.shape[0]:
+        return None
+
+    road_mask = probs[road_class_id, :, 0] >= float(probability_threshold)
+    if visible_mask is not None:
+        if visible_mask.numel() != road_mask.numel():
+            return None
+        road_mask = road_mask & visible_mask.to(device=road_mask.device, dtype=torch.bool)
+    return road_mask
+
+
+def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 1.0), candidate_mask=None):
     if gaussians.plane_normal is None or gaussians.plane_centroid is None:
         return 0
 
@@ -124,6 +140,11 @@ def prune_gaussians_above_road_plane(gaussians, margin=0.05, up_axis=(0.0, 0.0, 
 
     signed_distance = ((xyz - plane_centroid.unsqueeze(0)) * plane_normal.unsqueeze(0)).sum(dim=1)
     prune_mask = signed_distance > float(margin)
+
+    if candidate_mask is not None:
+        if candidate_mask.numel() != prune_mask.numel():
+            return 0
+        prune_mask = prune_mask & candidate_mask.to(device=prune_mask.device, dtype=torch.bool)
 
     if not prune_mask.any():
         return 0
@@ -148,10 +169,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         getattr(dataset, "road_mask_path", "object_mask_road"),
         source_path=getattr(dataset, "source_path", None)
     )
-    road_constraints_active = opt.flattened_road and road_manager.enabled
+    road_mask_source = str(getattr(opt, "road_mask_source", "class")).lower()
+    road_use_class_mask = road_mask_source == "class"
+    road_constraints_active = opt.flattened_road and (road_use_class_mask or road_manager.enabled)
 
-    if opt.flattened_road and not road_manager.enabled:
-        print("[RoadConstraint] Disabled because --road_mask_path is empty.")
+    if opt.flattened_road and not road_constraints_active:
+        print("[RoadConstraint] Disabled: set road_mask_source='class' or provide --road_mask_path for image-mask mode.")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -202,7 +225,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii, objects = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_object"]
 
         if road_constraints_active and iteration % max(1, opt.road_constraint_every) == 0:
-            road_gaussian_mask = road_manager.build_visible_road_mask(gaussians, viewpoint_cam, visibility_filter)
+            if road_use_class_mask:
+                road_gaussian_mask = build_road_class_mask(
+                    gaussians,
+                    classifier,
+                    road_class_id=opt.road_class_id,
+                    probability_threshold=opt.road_class_prob_threshold,
+                    visible_mask=visibility_filter,
+                )
+            else:
+                road_gaussian_mask = road_manager.build_visible_road_mask(gaussians, viewpoint_cam, visibility_filter)
+
             if road_gaussian_mask is not None and road_gaussian_mask.sum().item() >= opt.road_min_points:
                 # Use AXIS-AGNOSTIC plane fitting (works with any axis orientation)
                 print(f"[RoadConstraint] Applying height constraint using {road_gaussian_mask.sum().item()} visible road points.")
@@ -240,33 +273,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj
 
-        if road_constraints_active and gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0] and gaussians.height_constrained_mask.any():
-            constrained_mask = gaussians.height_constrained_mask
-            constrained_xyz = gaussians.get_xyz[constrained_mask]
-            constrained_targets = gaussians.height_constraint_values[constrained_mask]
+        # if road_constraints_active and gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0] and gaussians.height_constrained_mask.any():
+        #     constrained_mask = gaussians.height_constrained_mask
+        #     constrained_xyz = gaussians.get_xyz[constrained_mask]
+        #     constrained_targets = gaussians.height_constraint_values[constrained_mask]
             
-            # Compute height loss based on constraint type (axis-agnostic or legacy)
-            if gaussians.plane_normal is not None:
-                # AXIS-AGNOSTIC: Use plane normal direction
-                import torch as torch_module
-                plane_normal = torch_module.from_numpy(gaussians.plane_normal).float().to(device=constrained_xyz.device)
-                plane_centroid = torch_module.from_numpy(gaussians.plane_centroid).float().to(device=constrained_xyz.device)
+        #     # Compute height loss based on constraint type (axis-agnostic or legacy)
+        #     if gaussians.plane_normal is not None:
+        #         # AXIS-AGNOSTIC: Use plane normal direction
+        #         import torch as torch_module
+        #         plane_normal = torch_module.from_numpy(gaussians.plane_normal).float().to(device=constrained_xyz.device)
+        #         plane_centroid = torch_module.from_numpy(gaussians.plane_centroid).float().to(device=constrained_xyz.device)
                 
-                # Compute current distance along plane normal
-                current_vec = constrained_xyz - plane_centroid.unsqueeze(0)
-                current_distance = (current_vec * plane_normal.unsqueeze(0)).sum(dim=1)
+        #         # Compute current distance along plane normal
+        #         current_vec = constrained_xyz - plane_centroid.unsqueeze(0)
+        #         current_distance = (current_vec * plane_normal.unsqueeze(0)).sum(dim=1)
                 
-                # Distance error from target
-                loss_road_height = torch.mean((current_distance - constrained_targets) ** 2)
-            else:
-                # LEGACY: Z-axis only
-                loss_road_height = torch.mean((constrained_xyz[:, 2] - constrained_targets) ** 2)
+        #         # Distance error from target
+        #         loss_road_height = torch.mean((current_distance - constrained_targets) ** 2)
+        #     else:
+        #         # LEGACY: Z-axis only
+        #         loss_road_height = torch.mean((constrained_xyz[:, 2] - constrained_targets) ** 2)
             
-            loss = loss + opt.road_height_loss_weight * loss_road_height
+        #     loss = loss + opt.road_height_loss_weight * loss_road_height
 
-            constrained_opacity = gaussians.get_opacity[constrained_mask].squeeze(-1)
-            loss_road_hole = torch.relu(opt.road_min_opacity - constrained_opacity).mean()
-            loss = loss + opt.road_hole_loss_weight * loss_road_hole
+        #     constrained_opacity = gaussians.get_opacity[constrained_mask].squeeze(-1)
+        #     loss_road_hole = torch.relu(opt.road_min_opacity - constrained_opacity).mean()
+        #     loss = loss + opt.road_hole_loss_weight * loss_road_hole
 
         loss.backward()
         iter_end.record()
@@ -300,15 +333,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            if road_constraints_active and opt.remove_above_road and iteration % max(1, opt.road_remove_every) == 0:
-                pruned_count = prune_gaussians_above_road_plane(
-                    gaussians,
-                    margin=opt.road_above_margin,
-                    up_axis=opt.road_up_axis,
-                )
-                if pruned_count > 0:
-                    print(f"[RoadConstraint] Pruned {pruned_count} gaussians above road plane (margin={opt.road_above_margin:.4f}).")
-
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
@@ -321,6 +345,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    if road_constraints_active and opt.remove_above_road:
+        with torch.no_grad():
+            prune_candidate_mask = None
+            if road_use_class_mask:
+                prune_candidate_mask = build_road_class_mask(
+                    gaussians,
+                    classifier,
+                    road_class_id=opt.road_class_id,
+                    probability_threshold=opt.road_class_prob_threshold,
+                )
+            elif gaussians.height_constrained_mask.numel() == gaussians.get_xyz.shape[0]:
+                prune_candidate_mask = gaussians.height_constrained_mask
+
+            pruned_count = prune_gaussians_above_road_plane(
+                gaussians,
+                margin=opt.road_above_margin,
+                up_axis=opt.road_up_axis,
+                candidate_mask=prune_candidate_mask,
+            )
+            if pruned_count > 0:
+                print(f"[RoadConstraint] Post-training prune removed {pruned_count} gaussians above road plane (margin={opt.road_above_margin:.4f}).")
+            else:
+                print("[RoadConstraint] Post-training prune removed 0 gaussians.")
+
+            print("\n[POST] Saving pruned final Gaussians")
+            scene.save(opt.iterations)
+            torch.save(
+                classifier.state_dict(),
+                os.path.join(scene.model_path, f"point_cloud/iteration_{opt.iterations}", "classifier.pth")
+            )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -424,6 +479,9 @@ if __name__ == "__main__":
     args.remove_above_road = config.get("remove_above_road", args.remove_above_road)
     args.road_remove_every = config.get("road_remove_every", args.road_remove_every)
     args.road_above_margin = config.get("road_above_margin", args.road_above_margin)
+    args.road_mask_source = config.get("road_mask_source", args.road_mask_source)
+    args.road_class_id = config.get("road_class_id", args.road_class_id)
+    args.road_class_prob_threshold = config.get("road_class_prob_threshold", args.road_class_prob_threshold)
 
     road_up_axis_cfg = config.get("road_up_axis", args.road_up_axis)
     if isinstance(road_up_axis_cfg, str):

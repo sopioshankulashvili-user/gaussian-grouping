@@ -1,12 +1,12 @@
 {
     "densify_until_iter": 10000 ,
-    "num_classes": 2,
+    "num_classes": 3,
     "reg3d_interval": 5,
     "reg3d_k": 5,
     "reg3d_lambda_val": 2,
     "reg3d_max_points": 200000,
     "reg3d_sample_size": 1000,
-    "flattened_road": false,
+    "flattened_road": true,
     "road_mask_path" : "/data/sopio/small_city_50/25/object_mask_road",
     "remove_above_road": false
 }
