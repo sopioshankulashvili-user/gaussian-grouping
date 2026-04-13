@@ -587,6 +587,16 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+        if self.optimizer is None:
+            optimizable_tensors["xyz"] = nn.Parameter(self._xyz[mask].requires_grad_(True))
+            optimizable_tensors["f_dc"] = nn.Parameter(self._features_dc[mask].requires_grad_(True))
+            optimizable_tensors["f_rest"] = nn.Parameter(self._features_rest[mask].requires_grad_(True))
+            optimizable_tensors["opacity"] = nn.Parameter(self._opacity[mask].requires_grad_(True))
+            optimizable_tensors["scaling"] = nn.Parameter(self._scaling[mask].requires_grad_(True))
+            optimizable_tensors["rotation"] = nn.Parameter(self._rotation[mask].requires_grad_(True))
+            optimizable_tensors["obj_dc"] = nn.Parameter(self._objects_dc[mask].requires_grad_(True))
+            return optimizable_tensors
+
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -615,10 +625,26 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._objects_dc = optimizable_tensors["obj_dc"]
 
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        new_num_points = self.get_xyz.shape[0]
 
-        self.denom = self.denom[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.xyz_gradient_accum.numel() == valid_points_mask.shape[0]:
+            grad_mask = valid_points_mask.to(device=self.xyz_gradient_accum.device)
+            self.xyz_gradient_accum = self.xyz_gradient_accum[grad_mask]
+        else:
+            self.xyz_gradient_accum = torch.zeros((new_num_points, 1), device=self.get_xyz.device)
+
+        if self.denom.numel() == valid_points_mask.shape[0]:
+            denom_mask = valid_points_mask.to(device=self.denom.device)
+            self.denom = self.denom[denom_mask]
+        else:
+            self.denom = torch.zeros((new_num_points, 1), device=self.get_xyz.device)
+
+        if self.max_radii2D.numel() == valid_points_mask.shape[0]:
+            radii_mask = valid_points_mask.to(device=self.max_radii2D.device)
+            self.max_radii2D = self.max_radii2D[radii_mask]
+        else:
+            self.max_radii2D = torch.zeros((new_num_points), device=self.get_xyz.device)
+
         if self.inpaint_mask.numel() == valid_points_mask.shape[0]:
             self.inpaint_mask = self.inpaint_mask[valid_points_mask]
         else:

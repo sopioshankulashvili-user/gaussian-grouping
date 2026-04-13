@@ -53,7 +53,7 @@ class PseudoGTSupervision:
                 return None
             return cached.to(device)
 
-        image_file = self.pseudo_gt_path / f"{image_name}_pseudo_gt.png"
+        image_file = self.pseudo_gt_path / f"{image_name}.png"
         if not image_file.exists():
             self._cache[image_name] = None
             return None
@@ -128,7 +128,7 @@ def duplicate_and_translate_selected_gaussians(gaussians, mask3d, translation):
     return train_mask_expanded, translated_only_mask
 
 
-def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0.05, blend_radius=0.1):
+def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0.05, blend_radius=0.05):
     """
     Reduce opacity of gaussians in the destination area to create space for blending.
     
@@ -197,6 +197,39 @@ def reduce_opacity_simple(gaussians, mask, target_opacity=0.05):
             print(f"Reduced opacity for {mask.sum().item()} gaussians")
 
 
+def remove_gaussians_in_destination(gaussians, translated_mask3d):
+    """
+    Remove gaussians that fall inside the destination convex hull, excluding
+    the translated gaussians themselves.
+    """
+    with torch.no_grad():
+        translated_positions = gaussians._xyz.data[translated_mask3d]
+        if translated_positions.shape[0] == 0:
+            return None
+
+        from scipy.spatial import Delaunay
+
+        translated_points = translated_positions.detach().cpu().numpy()
+        if translated_points.shape[0] < 4:
+            destination_mask = translated_mask3d.clone()
+        else:
+            try:
+                hull = Delaunay(translated_points)
+                inside_mask = torch.from_numpy(
+                    hull.find_simplex(gaussians._xyz.detach().cpu().numpy()) >= 0
+                ).to(device=translated_mask3d.device)
+                destination_mask = inside_mask & (~translated_mask3d)
+            except Exception:
+                destination_mask = translated_mask3d.clone()
+
+        if destination_mask.sum().item() == 0:
+            return None
+
+        gaussians.prune_points(destination_mask)
+        print(f"Removed {destination_mask.sum().item()} gaussians in destination area")
+        return destination_mask
+
+
 def finetune_reposition(
     opt,
     model_path,
@@ -220,32 +253,55 @@ def finetune_reposition(
     supervision = PseudoGTSupervision(pseudo_gt_path)
 
     selected_obj_ids = torch.tensor(selected_obj_ids).cuda()
+    source_xyz_before_translation = gaussians._xyz.detach().clone()
     with torch.no_grad():
         logits3d = classifier(gaussians._objects_dc.permute(2, 0, 1))
         prob_obj3d = torch.softmax(logits3d, dim=0)
         mask = prob_obj3d[selected_obj_ids, :, :] > removal_thresh
         mask3d = mask.any(dim=0).squeeze()
-        mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(), mask3d, outlier_factor=1.0)
-        mask3d = torch.logical_or(mask3d, mask3d_convex)
+        # mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(), mask3d, outlier_factor=1.0)
+        # mask3d = torch.logical_or(mask3d, mask3d_convex)
 
-    translated_mask_for_blending = mask3d
+    source_anchor_mask_original = mask3d.clone()
+    target_anchor_mask = mask3d
     if keep_original_gaussians:
-        mask3d_for_optimizer, translated_mask_for_blending = duplicate_and_translate_selected_gaussians(
+        mask3d_for_optimizer, target_anchor_mask = duplicate_and_translate_selected_gaussians(
             gaussians, mask3d, translation
         )
     else:
         apply_translation_to_selected_gaussians(gaussians, mask3d, translation)
         mask3d_for_optimizer = mask3d
-    
-    # Optionally reduce opacity in destination area for better blending
+
+    source_neighborhood_mask = points_inside_convex_hull(
+        source_xyz_before_translation, source_anchor_mask_original, outlier_factor=1.0
+    )
+    if source_neighborhood_mask.shape[0] != target_anchor_mask.shape[0]:
+        source_neighborhood_mask_expanded = torch.zeros_like(target_anchor_mask, dtype=torch.bool)
+        source_neighborhood_mask_expanded[: source_neighborhood_mask.shape[0]] = source_neighborhood_mask
+        source_neighborhood_mask = source_neighborhood_mask_expanded
+
+    # Remove gaussians that already occupy the destination region before
+    # finetune_setup(), because pruning requires an initialized optimizer.
+    removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
+    if removed_mask is not None:
+        keep_mask = ~removed_mask
+        mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
+        target_anchor_mask = target_anchor_mask[keep_mask]
+        source_neighborhood_mask = source_neighborhood_mask[keep_mask]
+
+    target_neighborhood_mask = points_inside_convex_hull(
+        gaussians._xyz.detach(), target_anchor_mask, outlier_factor=1.0
+    )
+    mask3d_for_optimizer = torch.logical_or(source_neighborhood_mask, target_neighborhood_mask)
+    mask3d_for_optimizer = torch.logical_and(mask3d_for_optimizer, ~target_anchor_mask)
+
     if enable_opacity_blending:
         reduce_opacity_in_destination(
             gaussians, 
-            translated_mask_for_blending,
+            target_anchor_mask,
             target_opacity=opacity_blend_target,
             blend_radius=opacity_blend_radius
         )
-
     mask3d_for_optimizer = mask3d_for_optimizer.float()[:, None, None]
     gaussians.finetune_setup(opt, mask3d_for_optimizer)
 
