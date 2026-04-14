@@ -105,8 +105,8 @@ class OptimizationParams(ParamGroup):
         self.road_height_blend = 1.0
         self.remove_above_road = False
         self.road_remove_every = 7000
-        self.road_above_margin = 0.05
-        self.road_below_margin = 0.05
+        self.road_above_margin = 0.1
+        self.road_below_margin = 0.1
         self.road_up_axis = "0,0,1"
         self.road_mask_source = "class"
         self.road_class_id = 1

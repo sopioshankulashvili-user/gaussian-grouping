@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --time=1-0
 #SBATCH --partition=3090
-#SBATCH -J 1.4hieght
+#SBATCH -J 0.1_margin
 
 
 echo "Starting job ${SLURM_JOB_ID} on ${SLURMD_NODENAME}"
