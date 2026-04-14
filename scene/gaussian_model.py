@@ -75,12 +75,22 @@ class GaussianModel:
         n_points = self.get_xyz.shape[0]
         device = self.get_xyz.device
         if self.height_constrained_mask.numel() != n_points:
-            self.height_constrained_mask = torch.zeros((n_points), device=device, dtype=torch.bool)
+            old_mask = self.height_constrained_mask.to(device=device, dtype=torch.bool).flatten()
+            new_mask = torch.zeros((n_points), device=device, dtype=torch.bool)
+            copy_n = min(old_mask.numel(), n_points)
+            if copy_n > 0:
+                new_mask[:copy_n] = old_mask[:copy_n]
+            self.height_constrained_mask = new_mask
         else:
             self.height_constrained_mask = self.height_constrained_mask.to(device=device, dtype=torch.bool)
 
         if self.height_constraint_values.numel() != n_points:
-            self.height_constraint_values = torch.zeros((n_points), device=device, dtype=self.get_xyz.dtype)
+            old_values = self.height_constraint_values.to(device=device, dtype=self.get_xyz.dtype).flatten()
+            new_values = torch.zeros((n_points), device=device, dtype=self.get_xyz.dtype)
+            copy_n = min(old_values.numel(), n_points)
+            if copy_n > 0:
+                new_values[:copy_n] = old_values[:copy_n]
+            self.height_constraint_values = new_values
         else:
             self.height_constraint_values = self.height_constraint_values.to(device=device, dtype=self.get_xyz.dtype)
 
@@ -148,6 +158,7 @@ class GaussianModel:
             blend: Blending factor (0.0 = no constraint, 1.0 = full constraint)
         """
         self._sync_height_constraint_tensors()
+        print(self.height_constrained_mask.sum().item(), "Gaussians subject to height constraint.")
         if not self.height_constrained_mask.any():
             return
 
@@ -162,6 +173,7 @@ class GaussianModel:
                 constrained_scaling = self.get_scaling[constrained_mask]
                 constrained_rotation = self.get_rotation[constrained_mask]
                 if constrained_scaling.numel() == 0:
+                    print("exiting due to scaling numel 0")
                     return
 
                 R = self._quaternion_to_rotation_matrix(constrained_rotation)
@@ -173,6 +185,7 @@ class GaussianModel:
 
                 exceed_mask = current_var_along_normal > (target_var_along_normal + 1e-12)
                 if not exceed_mask.any():
+                    print("exiting due to no exceed mask")
                     return
 
                 ratio = torch.ones_like(current_var_along_normal)
@@ -200,6 +213,7 @@ class GaussianModel:
                 )
             else:
                 # LEGACY: Constrain Z-axis only
+                print("check self.plane_normal", self.plane_normal)
                 constrained_z = self._xyz.data[constrained_mask, 2]
                 target_z = self.height_constraint_values[constrained_mask]
                 self._xyz.data[constrained_mask, 2] = (1.0 - blend) * constrained_z + blend * target_z

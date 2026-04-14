@@ -1,11 +1,11 @@
 {
-    "num_classes": 2,
+    "num_classes": 3,
     "removal_thresh": 0.4,
-    "select_obj_id" : [1],
+    "select_obj_id" : [2],
     "images": "/data/sopio/small_city_50/25_inpainted/images",
     "object_path" : "/data/sopio/small_city_50/25/object_mask",
     "r" : 1,
     "lambda_dlpips" : 0.4,
-    "finetune_iteration": 30000,
+    "finetune_iteration": 7000,
     "flattened_road": false
 }

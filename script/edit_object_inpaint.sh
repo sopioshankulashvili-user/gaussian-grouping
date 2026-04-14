@@ -33,7 +33,7 @@ conda activate gaussian_grouping
 
 
 # Remove the selected object
-python edit_object_inpaint.py  -m output/small_city_50/25_1 --config_file config/object_inpaint/road_damage.json --inpaint_strategy "direct" --iteration 7000
+python edit_object_inpaint.py  -m output/small_city_50/25 --config_file config/object_inpaint/road_damage.json --inpaint_strategy "direct" --iteration 7000
 
 
 

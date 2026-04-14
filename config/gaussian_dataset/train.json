@@ -8,5 +8,5 @@
     "reg3d_sample_size": 1000,
     "flattened_road": true,
     "road_mask_path" : "/data/sopio/small_city_50/25/object_mask_road",
-    "remove_above_road": true
+    "remove_above_road": false
 }
