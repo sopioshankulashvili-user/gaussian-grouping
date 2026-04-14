@@ -265,10 +265,29 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
 
                 if gaussians.plane_normal is not None:
                     plane_normal = torch.from_numpy(gaussians.plane_normal).float().to(device=constrained_xyz.device)
-                    plane_centroid = torch.from_numpy(gaussians.plane_centroid).float().to(device=constrained_xyz.device)
-                    current_vec = constrained_xyz - plane_centroid.unsqueeze(0)
-                    current_distance = (current_vec * plane_normal.unsqueeze(0)).sum(dim=1)
-                    loss_road_height = torch.mean((current_distance - constrained_targets) ** 2)
+                    plane_normal = plane_normal / torch.clamp(torch.norm(plane_normal), min=1e-12)
+
+                    constrained_scaling = gaussians.get_scaling[constrained_mask]
+                    constrained_rotation = gaussians.get_rotation[constrained_mask]
+                    q = constrained_rotation / torch.clamp(torch.norm(constrained_rotation, dim=1, keepdim=True), min=1e-12)
+                    w, x, y, z = q.unbind(dim=1)
+                    R = torch.empty((q.shape[0], 3, 3), dtype=q.dtype, device=q.device)
+                    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+                    R[:, 0, 1] = 2 * (x * y - w * z)
+                    R[:, 0, 2] = 2 * (x * z + w * y)
+                    R[:, 1, 0] = 2 * (x * y + w * z)
+                    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+                    R[:, 1, 2] = 2 * (y * z - w * x)
+                    R[:, 2, 0] = 2 * (x * z - w * y)
+                    R[:, 2, 1] = 2 * (y * z + w * x)
+                    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+
+                    normal_batch = plane_normal.view(1, 3, 1).expand(R.shape[0], -1, -1)
+                    normal_local = torch.bmm(R.transpose(1, 2), normal_batch).squeeze(-1)
+                    current_cov_along_normal = (constrained_scaling.pow(2) * normal_local.pow(2)).sum(dim=1)
+
+                    overflow = torch.relu(current_cov_along_normal - constrained_targets)
+                    loss_road_height = torch.mean(overflow ** 2)
                 else:
                     loss_road_height = torch.mean((constrained_xyz[:, 2] - constrained_targets) ** 2)
 

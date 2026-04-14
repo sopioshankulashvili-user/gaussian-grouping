@@ -275,7 +275,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 constraint_values, plane_info = create_road_height_constraint(
                     gaussians, 
                     road_gaussian_mask, 
-                    height_value=1.4, #if we want to hardcode height
+                    # height_value=1.4, #if we want to hardcode height
                     method='fit_plane_axis_agnostic'
                 )
 
