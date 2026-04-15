@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --time=1-0
 #SBATCH --partition=3090
-#SBATCH -J dupl_opacity_reposition
+#SBATCH -J nomargin
 
 
 echo "Starting job ${SLURM_JOB_ID} on ${SLURMD_NODENAME}"

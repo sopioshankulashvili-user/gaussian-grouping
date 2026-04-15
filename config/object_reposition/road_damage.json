@@ -1,15 +1,15 @@
 {
-  "num_classes": 2,
-  "select_obj_id": [1],
+  "num_classes": 3,
+  "select_obj_id": [2],
   "removal_thresh": 0.4,
   "images": "/data/sopio/small_city_50/25/images",
   "object_path": "/data/sopio/small_city_50/25/object_mask",
   "r": 1,
   "lambda_dlpips": 0.5,
   "reposition_lambda_ssim": 0.2,
-  "finetune_iteration": 30000,
+  "finetune_iteration": 700,
   "translation": [-0.10, 0.0, 0.04],
   "pseudo_gt_path": "/data/sopio/small_city_50/25_inpainted/images",
-  "enable_opacity_blending": false,
+  "enable_opacity_blending": true,
   "keep_original_gaussians": true
 }

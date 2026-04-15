@@ -229,6 +229,104 @@ def remove_gaussians_in_destination(gaussians, translated_mask3d):
         print(f"Removed {destination_mask.sum().item()} gaussians in destination area")
         return destination_mask
 
+def _quaternion_to_rotation_matrix(quaternions):
+    q = quaternions / torch.clamp(torch.norm(quaternions, dim=1, keepdim=True), min=1e-12)
+    w, x, y, z = q.unbind(dim=1)
+
+    R = torch.empty((q.shape[0], 3, 3), dtype=q.dtype, device=q.device)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - w * z)
+    R[:, 0, 2] = 2 * (x * z + w * y)
+    R[:, 1, 0] = 2 * (x * y + w * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - w * x)
+    R[:, 2, 0] = 2 * (x * z - w * y)
+    R[:, 2, 1] = 2 * (y * z + w * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
+
+
+def cap_covariances_toward_target(gaussians, source_mask, target_mask, blend=1.0, safety_margin=0.05):
+    """
+    Prevent source-side Gaussian covariances from stretching into the target region's
+    bounding box. Uses axis-aligned bounding box to define the protected destination area.
+    
+    Args:
+        gaussians: GaussianModel instance
+        source_mask: Boolean mask of source Gaussians to constrain
+        target_mask: Boolean mask defining target region via bounding box
+        blend: Blending parameter (1.0 = full constraint, 0.0 = no constraint)
+        safety_margin: Extra margin around bbox to maintain (default 0.05)
+    """
+    with torch.no_grad():
+        source_mask = source_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).flatten()
+        target_mask = target_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).flatten()
+
+        if not source_mask.any() or not target_mask.any():
+            return 0
+
+        # Compute bounding box from target region
+        target_positions = gaussians.get_xyz[target_mask]
+        bbox_min = target_positions.min(dim=0).values
+        bbox_max = target_positions.max(dim=0).values
+        bbox_min = bbox_min - safety_margin
+        bbox_max = bbox_max + safety_margin
+        
+        source_indices = torch.where(source_mask)[0]
+        source_positions = gaussians.get_xyz[source_mask]
+        
+        if source_positions.shape[0] == 0:
+            return 0
+
+        # Find closest point on bbox for each source Gaussian
+        # Clamp position to bbox to get closest point
+        closest_points = torch.clamp(source_positions, bbox_min, bbox_max)
+        distances_to_bbox = torch.norm(source_positions - closest_points, dim=1)
+
+        constrained_scaling = gaussians.get_scaling[source_mask]
+        constrained_rotation = gaussians.get_rotation[source_mask]
+        
+        # Compute uniform scaling estimate as average scale
+        uniform_scale = constrained_scaling.mean(dim=1)
+        
+        # Identify Gaussians that would stretch into the bbox
+        # A Gaussian stretches into bbox if its scale is comparable to or larger than distance to bbox
+        shrink_mask = distances_to_bbox <= (uniform_scale + safety_margin)
+        
+        if not shrink_mask.any():
+            return 0
+
+        # Compute shrinking ratios for violating Gaussians
+        active_distances = distances_to_bbox[shrink_mask]
+        active_scaling = constrained_scaling[shrink_mask]
+        
+        # Target extent should not reach the bbox
+        target_extent = torch.clamp(active_distances - safety_margin, min=1e-8)
+        current_extent = active_scaling.mean(dim=1)
+        
+        # Compute shrinking ratio needed
+        ratio = torch.sqrt(
+            torch.clamp(
+                target_extent / torch.clamp(current_extent, min=1e-12),
+                min=0.0,
+                max=1.0,
+            )
+        )
+        blended_ratio = (1.0 - blend) + blend * ratio
+
+        # Apply shrinking to violating Gaussians
+        shrink_indices = source_indices[shrink_mask]
+        new_scaling = active_scaling * blended_ratio.unsqueeze(1)
+        gaussians._scaling.data[shrink_indices] = gaussians.scaling_inverse_activation(
+            torch.clamp(new_scaling, min=1e-8)
+        )
+
+        print(
+            f"[Reposition] Capped covariance for {int(shrink_mask.sum().item())} gaussians "
+            f"to avoid stretching into target bbox."
+        )
+        return int(shrink_mask.sum().item())
+
 
 def finetune_reposition(
     opt,
@@ -246,7 +344,7 @@ def finetune_reposition(
     pseudo_gt_path,
     lambda_ssim=0.2,
     enable_opacity_blending=False,
-    opacity_blend_target=0.05,
+    opacity_blend_target=0.0,
     opacity_blend_radius=0.1,
     keep_original_gaussians=False,
 ):
@@ -282,12 +380,12 @@ def finetune_reposition(
 
     # Remove gaussians that already occupy the destination region before
     # finetune_setup(), because pruning requires an initialized optimizer.
-    # removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
-    # if removed_mask is not None:
-    #     keep_mask = ~removed_mask
-    #     mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
-    #     target_anchor_mask = target_anchor_mask[keep_mask]
-    #     source_neighborhood_mask = source_neighborhood_mask[keep_mask]
+    removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
+    if removed_mask is not None:
+        keep_mask = ~removed_mask
+        mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
+        target_anchor_mask = target_anchor_mask[keep_mask]
+        source_neighborhood_mask = source_neighborhood_mask[keep_mask]
 
     target_neighborhood_mask = points_inside_convex_hull(
         gaussians._xyz.detach(), target_anchor_mask, outlier_factor=1.0
@@ -295,15 +393,8 @@ def finetune_reposition(
     mask3d_for_optimizer = torch.logical_or(source_neighborhood_mask, target_neighborhood_mask)
     mask3d_for_optimizer = torch.logical_and(mask3d_for_optimizer, ~target_anchor_mask)
 
-    if enable_opacity_blending:
-        reduce_opacity_in_destination(
-            gaussians, 
-            target_anchor_mask,
-            target_opacity=opacity_blend_target,
-            blend_radius=opacity_blend_radius
-        )
-    mask3d_for_optimizer = mask3d_for_optimizer.float()[:, None, None]
-    gaussians.finetune_setup(opt, mask3d_for_optimizer)
+    finetune_mask = mask3d_for_optimizer.clone()
+    gaussians.finetune_setup(opt, finetune_mask.float()[:, None, None])
 
     lpips_metric = lpips.LPIPS(net="vgg")
     for param in lpips_metric.parameters():
@@ -341,7 +432,34 @@ def finetune_reposition(
         loss = (0.8 - opt.lambda_dssim) * l1 + opt.lambda_dssim * lpips_loss + lambda_ssim * ssim_loss
         loss.backward()
 
+        # with torch.no_grad():
+        #     if iteration < 5000 :
+        #         gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+        #         gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+        #         if  iteration % 300 == 0:
+        #             size_threshold = 20 
+        #             gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, cameras_extent, size_threshold)
+  
+
+        # if enable_opacity_blending:
+        #     reduce_opacity_in_destination(
+        #         gaussians, 
+        #         target_anchor_mask,
+        #         target_opacity=opacity_blend_target,
+        #         blend_radius=opacity_blend_radius
+        #     )
+
         gaussians.optimizer.step()
+
+        # cap_covariances_toward_target(
+        #     gaussians,
+        #     finetune_mask,
+        #     target_anchor_mask,
+        #     blend=0.5,
+        #     safety_margin=0.05,
+        # )
+        
         gaussians.optimizer.zero_grad(set_to_none=True)
 
         if i % 10 == 0:
@@ -349,14 +467,14 @@ def finetune_reposition(
             progress_bar.update(10)
     progress_bar.close()
 
-    removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
-    if removed_mask is not None:
-        keep_mask = ~removed_mask
-        mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
-        target_anchor_mask = target_anchor_mask[keep_mask]
-        source_neighborhood_mask = source_neighborhood_mask[keep_mask]
+    # removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
+    # if removed_mask is not None:
+    #     keep_mask = ~removed_mask
+    #     mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
+    #     target_anchor_mask = target_anchor_mask[keep_mask]
+    #     source_neighborhood_mask = source_neighborhood_mask[keep_mask]
 
-    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition_copy/iteration_{iteration}")
+    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition/iteration_{iteration}")
     gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
     return gaussians
 
@@ -465,7 +583,7 @@ def reposition(
 
     dataset.object_path = "object_mask"
     dataset.images = "images"
-    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition_copy/iteration_{scene.loaded_iter}", shuffle=False)
+    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition/iteration_{scene.loaded_iter}", shuffle=False)
 
     with torch.no_grad():
         if not skip_train:
