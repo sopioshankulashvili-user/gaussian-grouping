@@ -230,10 +230,31 @@ def fit_plane_to_points_axis_agnostic(xyz, mask, return_full_info=False):
         }
 
 
-def compute_constraint_values_along_normal(xyz, plane_info, mask):
+def _quaternion_to_rotation_matrix(quaternions):
+    """Convert quaternions (w, x, y, z) to rotation matrices."""
+    q = quaternions / torch.clamp(torch.norm(quaternions, dim=1, keepdim=True), min=1e-12)
+    w, x, y, z = q.unbind(dim=1)
+
+    R = torch.empty((q.shape[0], 3, 3), dtype=q.dtype, device=q.device)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - w * z)
+    R[:, 0, 2] = 2 * (x * z + w * y)
+    R[:, 1, 0] = 2 * (x * y + w * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - w * x)
+    R[:, 2, 0] = 2 * (x * z - w * y)
+    R[:, 2, 1] = 2 * (y * z + w * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
+
+
+def compute_constraint_values_along_normal(xyz, plane_info, mask, scaling=None, rotation=None):
     """
-    Compute constraint values for each point projected onto the plane normal.
-    This replaces the hardcoded Z-axis assumption.
+    Compute per-point constraint values along the plane normal.
+
+    If `scaling` and `rotation` are provided, this returns covariance thresholds
+    (variance along the plane normal) for constrained Gaussians.
+    Otherwise, it falls back to signed center-distance projection values.
     
     Args:
         xyz: Tensor of shape (N, 3) containing Gaussian positions
@@ -241,9 +262,34 @@ def compute_constraint_values_along_normal(xyz, plane_info, mask):
         mask: Boolean tensor indicating which points are constrained
     
     Returns:
-        constraint_values: Tensor of shape (N,) with distance along plane normal for each point
-                          (or 0 for unconstrained points)
+        constraint_values: Tensor of shape (N,)
+                          - covariance threshold (variance along normal) when
+                            scaling/rotation are provided
+                          - signed center-distance projection otherwise
     """
+    if scaling is not None and rotation is not None:
+        if not isinstance(scaling, torch.Tensor) or not isinstance(rotation, torch.Tensor):
+            raise TypeError("scaling and rotation must be torch.Tensor when provided")
+
+        device = scaling.device
+        dtype = scaling.dtype
+        mask_t = mask.to(device=device, dtype=torch.bool)
+
+        normal_t = torch.as_tensor(plane_info['normal'], dtype=dtype, device=device)
+        normal_t = normal_t / torch.clamp(torch.norm(normal_t), min=1e-12)
+
+        scaling_detached = scaling.detach()
+        rotation_detached = rotation.detach()
+        R = _quaternion_to_rotation_matrix(rotation_detached)
+
+        normal_batch = normal_t.view(1, 3, 1).expand(R.shape[0], -1, -1)
+        normal_local = torch.bmm(R.transpose(1, 2), normal_batch).squeeze(-1)
+
+        covariance_along_normal = (scaling_detached.pow(2) * normal_local.pow(2)).sum(dim=1)
+        constraint_values = torch.zeros(scaling.shape[0], dtype=dtype, device=device)
+        constraint_values[mask_t] = covariance_along_normal[mask_t]
+        return constraint_values.detach()
+
     if isinstance(xyz, torch.Tensor):
         device = xyz.device
         dtype = xyz.dtype
@@ -271,12 +317,13 @@ def compute_constraint_values_along_normal(xyz, plane_info, mask):
 
 def create_road_height_constraint(gaussians, mask, height_value=None, method='fit_plane_axis_agnostic', plane_info=None):
     """
-    Create a height constraint for road Gaussians (AXIS-AGNOSTIC).
+    Create a covariance-growth constraint for road Gaussians (AXIS-AGNOSTIC).
     
     Args:
         gaussians: GaussianModel instance
         mask: Boolean tensor indicating which Gaussians are part of the road
-        height_value: Optional fixed height value. If None, computed from the data
+        height_value: Optional fixed variance threshold along normal. If None,
+                  uses the current covariance-along-normal per Gaussian.
         method: 'fit_plane_axis_agnostic' (recommended), 'mean', 'median', 'fit_plane'
         plane_info: Pre-computed plane info dict. If None, will be computed
     
@@ -286,7 +333,7 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
     xyz = gaussians.get_xyz
     
     if method in ('fit_plane_axis_agnostic', 'ransac'):
-        # Compute plane and project points onto normal direction
+        # Compute plane and build covariance thresholds along normal direction
         if plane_info is None:
             if method == 'ransac':
                 plane_info = fit_plane_to_points_ransac(xyz, mask, return_full_info=False)
@@ -294,7 +341,13 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
                 plane_info = fit_plane_to_points_axis_agnostic(xyz, mask, return_full_info=False)
 
         if height_value is None:
-            constraint_values = compute_constraint_values_along_normal(xyz, plane_info, mask).detach()
+            constraint_values = compute_constraint_values_along_normal(
+                xyz,
+                plane_info,
+                mask,
+                scaling=gaussians.get_scaling,
+                rotation=gaussians.get_rotation,
+            ).detach()
         else:
             mask_t = mask.to(device=xyz.device, dtype=torch.bool)
             constraint_values = torch.zeros(xyz.shape[0], dtype=xyz.dtype, device=xyz.device)
@@ -306,8 +359,11 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
         print(f"  Plane normal: [{plane_info['normal'][0]:.4f}, {plane_info['normal'][1]:.4f}, {plane_info['normal'][2]:.4f}]")
         print(f"  Plane centroid: [{plane_info['centroid'][0]:.4f}, {plane_info['centroid'][1]:.4f}, {plane_info['centroid'][2]:.4f}]")
         print(f"  Constrained Gaussians: {mask.sum().item()}")
+        if height_value is None and mask.any():
+            vals = constraint_values[mask.to(device=constraint_values.device, dtype=torch.bool)]
+            print(f"  Normal covariance cap (mean): {vals.mean().item():.6f}")
         if height_value is not None:
-            print(f"  Fixed normal-distance target: {float(height_value):.4f}")
+            print(f"  Fixed normal covariance cap: {float(height_value):.6f}")
         
         # Store both the constraint values and the plane info in the Gaussian model
         gaussians.set_height_constraint(mask, constraint_values, plane_info=plane_info)
@@ -324,7 +380,13 @@ def create_road_height_constraint(gaussians, mask, height_value=None, method='fi
     elif method == 'ransac':
         centroid, normal, d = fit_plane_to_points_ransac(xyz, mask, return_full_info=True)
         plane_info = {'centroid': centroid, 'normal': normal, 'd': d}
-        height_value = compute_constraint_values_along_normal(xyz, plane_info, mask).detach()
+        height_value = compute_constraint_values_along_normal(
+            xyz,
+            plane_info,
+            mask,
+            scaling=gaussians.get_scaling,
+            rotation=gaussians.get_rotation,
+        ).detach()
     else:
         raise ValueError(f"Unknown method: {method}")
     

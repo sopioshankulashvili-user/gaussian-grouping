@@ -75,12 +75,22 @@ class GaussianModel:
         n_points = self.get_xyz.shape[0]
         device = self.get_xyz.device
         if self.height_constrained_mask.numel() != n_points:
-            self.height_constrained_mask = torch.zeros((n_points), device=device, dtype=torch.bool)
+            old_mask = self.height_constrained_mask.to(device=device, dtype=torch.bool).flatten()
+            new_mask = torch.zeros((n_points), device=device, dtype=torch.bool)
+            copy_n = min(old_mask.numel(), n_points)
+            if copy_n > 0:
+                new_mask[:copy_n] = old_mask[:copy_n]
+            self.height_constrained_mask = new_mask
         else:
             self.height_constrained_mask = self.height_constrained_mask.to(device=device, dtype=torch.bool)
 
         if self.height_constraint_values.numel() != n_points:
-            self.height_constraint_values = torch.zeros((n_points), device=device, dtype=self.get_xyz.dtype)
+            old_values = self.height_constraint_values.to(device=device, dtype=self.get_xyz.dtype).flatten()
+            new_values = torch.zeros((n_points), device=device, dtype=self.get_xyz.dtype)
+            copy_n = min(old_values.numel(), n_points)
+            if copy_n > 0:
+                new_values[:copy_n] = old_values[:copy_n]
+            self.height_constraint_values = new_values
         else:
             self.height_constraint_values = self.height_constraint_values.to(device=device, dtype=self.get_xyz.dtype)
 
@@ -122,15 +132,33 @@ class GaussianModel:
         self.plane_normal = None
         self.plane_centroid = None
 
+    @staticmethod
+    def _quaternion_to_rotation_matrix(quaternions):
+        q = quaternions / torch.clamp(torch.norm(quaternions, dim=1, keepdim=True), min=1e-12)
+        w, x, y, z = q.unbind(dim=1)
+
+        R = torch.empty((q.shape[0], 3, 3), dtype=q.dtype, device=q.device)
+        R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+        R[:, 0, 1] = 2 * (x * y - w * z)
+        R[:, 0, 2] = 2 * (x * z + w * y)
+        R[:, 1, 0] = 2 * (x * y + w * z)
+        R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+        R[:, 1, 2] = 2 * (y * z - w * x)
+        R[:, 2, 0] = 2 * (x * z - w * y)
+        R[:, 2, 1] = 2 * (y * z + w * x)
+        R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+        return R
+
     def apply_height_constraint_to_gradients(self, blend=1.0):
         """
-        Apply height constraints to Gaussians by projecting positions onto the constraint plane.
-        Supports both axis-agnostic (plane normal) and legacy (Z-axis) constraints.
+        Apply axis-agnostic covariance constraints along the plane normal.
+        Supports legacy Z-axis center constraint if no plane normal is set.
         
         Args:
             blend: Blending factor (0.0 = no constraint, 1.0 = full constraint)
         """
         self._sync_height_constraint_tensors()
+        print(self.height_constrained_mask.sum().item(), "Gaussians subject to height constraint.")
         if not self.height_constrained_mask.any():
             return
 
@@ -139,28 +167,53 @@ class GaussianModel:
             constrained_mask = self.height_constrained_mask
             
             if self.plane_normal is not None:
-                # AXIS-AGNOSTIC: Use plane normal to constrain
-                plane_normal = torch.from_numpy(self.plane_normal).float().to(device=self._xyz.device)
-                plane_centroid = torch.from_numpy(self.plane_centroid).float().to(device=self._xyz.device)
-                
-                constrained_xyz = self._xyz.data[constrained_mask]
-                target_distance = self.height_constraint_values[constrained_mask]
-                
-                # Current distance from plane along normal
-                current_vec = constrained_xyz - plane_centroid.unsqueeze(0)
-                current_distance = (current_vec * plane_normal.unsqueeze(0)).sum(dim=1)
-                
-                # Compute correction
-                distance_error = current_distance - target_distance
-                
-                # Apply correction along plane normal
-                correction = distance_error.unsqueeze(1) * plane_normal.unsqueeze(0)
-                blended_correction = blend * correction
-                print("[HeightConstraint] Applying axis-agnostic height constraint with blend factor {:.4f}. Max correction: {:.6f}".format(blend, blended_correction.abs().max().item()))
-                
-                self._xyz.data[constrained_mask] -= blended_correction
+                plane_normal = torch.from_numpy(self.plane_normal).to(device=self._xyz.device, dtype=self._xyz.dtype)
+                plane_normal = plane_normal / torch.clamp(torch.norm(plane_normal), min=1e-12)
+
+                constrained_scaling = self.get_scaling[constrained_mask]
+                constrained_rotation = self.get_rotation[constrained_mask]
+                if constrained_scaling.numel() == 0:
+                    print("exiting due to scaling numel 0")
+                    return
+
+                R = self._quaternion_to_rotation_matrix(constrained_rotation)
+                normal_batch = plane_normal.view(1, 3, 1).expand(R.shape[0], -1, -1)
+                normal_local = torch.bmm(R.transpose(1, 2), normal_batch).squeeze(-1)
+
+                current_var_along_normal = (constrained_scaling.pow(2) * normal_local.pow(2)).sum(dim=1)
+                target_var_along_normal = self.height_constraint_values[constrained_mask].clamp_min(0.0)
+
+                exceed_mask = current_var_along_normal > (target_var_along_normal + 1e-12)
+                if not exceed_mask.any():
+                    print("exiting due to no exceed mask")
+                    return
+
+                ratio = torch.ones_like(current_var_along_normal)
+                ratio[exceed_mask] = torch.sqrt(
+                    torch.clamp(
+                        target_var_along_normal[exceed_mask] / torch.clamp(current_var_along_normal[exceed_mask], min=1e-12),
+                        min=0.0,
+                        max=1.0,
+                    )
+                )
+                blended_ratio = (1.0 - blend) + blend * ratio
+
+                new_scaling = constrained_scaling * blended_ratio.unsqueeze(1)
+                self._scaling.data[constrained_mask] = self.scaling_inverse_activation(torch.clamp(new_scaling, min=1e-8))
+
+                max_var_before = current_var_along_normal.max().item()
+                max_var_after = (
+                    (new_scaling.pow(2) * normal_local.pow(2)).sum(dim=1)
+                ).max().item()
+                print(
+                    "[HeightConstraint] Applied covariance cap along plane normal "
+                    "with blend {:.4f}. Max variance {:.6f} -> {:.6f}".format(
+                        blend, max_var_before, max_var_after
+                    )
+                )
             else:
                 # LEGACY: Constrain Z-axis only
+                print("check self.plane_normal", self.plane_normal)
                 constrained_z = self._xyz.data[constrained_mask, 2]
                 target_z = self.height_constraint_values[constrained_mask]
                 self._xyz.data[constrained_mask, 2] = (1.0 - blend) * constrained_z + blend * target_z

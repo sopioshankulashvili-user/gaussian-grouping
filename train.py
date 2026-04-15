@@ -271,14 +271,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if road_gaussian_mask is not None and road_gaussian_mask.sum().item() >= opt.road_min_points:
                 # Use AXIS-AGNOSTIC plane fitting (works with any axis orientation)
-                print(f"[RoadConstraint] Applying height constraint using {road_gaussian_mask.sum().item()} visible road points.")
+                print(f"[RoadConstraint] Computing height constraint using {road_gaussian_mask.sum().item()} visible road points.")
                 constraint_values, plane_info = create_road_height_constraint(
                     gaussians, 
                     road_gaussian_mask, 
-                    height_value=1.4, #if we want to hardcode height
+                    height_value=0.5, #if we want to hardcode height
                     method='fit_plane_axis_agnostic'
                 )
-
                 if gaussians.plane_normal is not None and gaussians.plane_centroid is not None:
                         n = gaussians.plane_normal.astype(np.float64)   # [a, b, c]
                         c0 = gaussians.plane_centroid.astype(np.float64)
@@ -413,8 +412,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                # for every thousand iterations
-                if road_constraints_active and iteration % 1000 == 0:
+                # for every 500 iterations
+                if road_constraints_active and iteration % 500 == 0:
                     gaussians.apply_height_constraint_to_gradients(blend=opt.road_height_blend)
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 cls_optimizer.step()
