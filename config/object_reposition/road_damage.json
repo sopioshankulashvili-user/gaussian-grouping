@@ -10,6 +10,6 @@
   "finetune_iteration": 700,
   "translation": [-0.10, 0.0, 0.04],
   "pseudo_gt_path": "/data/sopio/small_city_50/25_inpainted/images",
-  "enable_opacity_blending": true,
+  "enable_opacity_blending": false,
   "keep_original_gaussians": true
 }
