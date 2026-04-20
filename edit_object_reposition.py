@@ -128,6 +128,45 @@ def duplicate_and_translate_selected_gaussians(gaussians, mask3d, translation):
     return train_mask_expanded, translated_only_mask
 
 
+def _render_with_active_mask(view, gaussians, pipeline, background, active_mask):
+    """Render while temporarily disabling gaussians outside active_mask."""
+    active_mask = active_mask.to(device=gaussians._opacity.device, dtype=torch.bool).flatten()
+    original_opacity = gaussians._opacity.data.clone()
+    try:
+        inactive_mask = ~active_mask
+        if inactive_mask.any():
+            from utils.general_utils import inverse_sigmoid
+
+            gaussians._opacity.data[inactive_mask] = inverse_sigmoid(
+                torch.full((int(inactive_mask.sum().item()), 1), 1e-6, device=gaussians._opacity.device, dtype=gaussians._opacity.dtype)
+            )
+        return render(view, gaussians, pipeline, background)
+    finally:
+        gaussians._opacity.data.copy_(original_opacity)
+
+
+def _composite_two_passes(bg_pkg, fg_pkg, background):
+    bg_render = bg_pkg["render"]      # [3, H, W]
+    fg_render = fg_pkg["render"]      # [3, H, W]
+    
+    # Use the foreground's actual accumulated opacity (Alpha)
+    # Ensure this is [1, H, W]
+    print(fg_pkg.keys())
+    fg_alpha = fg_pkg["opacity"] 
+
+    print(f"Foreground alpha stats - min: {fg_alpha.min().item():.6f}, max: {fg_alpha.max().item():.6f}, mean: {fg_alpha.mean().item():.6f}")
+
+    # Standard "Over" operator: Result = FG + (1 - Alpha_FG) * BG
+    # This assumes FG is already premultiplied (Standard in 3DGS)
+    render_out = fg_render + (1.0 - fg_alpha) * bg_render
+
+    # Composite the object IDs/Auxiliary maps similarly or with a hard threshold
+    fg_mask = fg_alpha > 0.5
+    render_obj_out = torch.where(fg_mask, fg_pkg["render_object"], bg_pkg["render_object"])
+    
+    return render_out, render_obj_out
+
+
 def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0.05, blend_radius=0.05):
     """
     Reduce opacity of gaussians in the destination area to create space for blending.
@@ -156,7 +195,12 @@ def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0
             destination_mask = translated_mask3d.clone()
         else:
             try:
-                hull = Delaunay(translated_points)
+                center = translated_points.mean(axis=0)
+                shrink_factor = 0.8  # < 1.0 shrinks the hull
+
+                translated_points_shrunk = center + shrink_factor * (translated_points - center)
+                hull = Delaunay(translated_points_shrunk)
+                # hull = Delaunay(translated_points)
                 inside_mask = torch.from_numpy(
                     hull.find_simplex(all_positions.detach().cpu().numpy()) >= 0
                 ).to(device=translated_mask3d.device)
@@ -173,79 +217,6 @@ def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0
 
         gaussians._opacity.data[destination_mask] = target_opacity_internal
         print(f"Reduced opacity for {destination_mask.sum().item()} gaussians in destination area")
-
-
-
-# def remove_gaussians_in_destination(
-#     gaussians,
-#     source_xyz_before_translation,
-#     source_anchor_mask_original,
-#     translation,
-#     protected_mask=None,
-#     match_radius=0.015,
-# ):
-#     """
-#     Translate source-anchor centers using the translation vector and remove
-#     other gaussians that overlap those translated positions.
-#     """
-#     with torch.no_grad():
-#         source_anchor_mask_original = source_anchor_mask_original.to(
-#             device=source_xyz_before_translation.device, dtype=torch.bool
-#         ).flatten()
-#         if source_anchor_mask_original.sum().item() == 0:
-#             return None
-
-#         from scipy.spatial import cKDTree
-
-#         translation_tensor = torch.tensor(
-#             translation,
-#             dtype=source_xyz_before_translation.dtype,
-#             device=source_xyz_before_translation.device,
-#         )
-#         translated_positions = source_xyz_before_translation[source_anchor_mask_original] + translation_tensor
-#         if translated_positions.shape[0] == 0:
-#             return None
-
-#         translated_points = translated_positions.detach().cpu().numpy().astype(np.float32)
-#         all_points = gaussians._xyz.detach().cpu().numpy().astype(np.float32)
-
-#         if match_radius is None or match_radius <= 0:
-#             if translated_points.shape[0] >= 2:
-#                 translated_tree = cKDTree(translated_points)
-#                 nn_distances, _ = translated_tree.query(translated_points, k=2)
-#                 match_radius = float(np.median(nn_distances[:, 1]) * 0.1)
-#             else:
-#                 match_radius = 1e-3
-
-#         match_radius = max(float(match_radius), 1e-6)
-
-#         try:
-#             all_tree = cKDTree(all_points)
-#             neighbor_lists = all_tree.query_ball_point(translated_points, r=match_radius)
-#             if len(neighbor_lists) == 0:
-#                 destination_mask = torch.zeros((all_points.shape[0],), device=gaussians._xyz.device, dtype=torch.bool)
-#             else:
-#                 non_empty_neighbors = [np.asarray(ids, dtype=np.int64) for ids in neighbor_lists if len(ids) > 0]
-#                 destination_mask = torch.zeros((all_points.shape[0],), device=gaussians._xyz.device, dtype=torch.bool)
-#                 if len(non_empty_neighbors) == 0:
-#                     return None
-#                 neighbor_indices = np.unique(np.concatenate(non_empty_neighbors))
-#                 if neighbor_indices.size > 0:
-#                     destination_mask[torch.from_numpy(neighbor_indices).to(device=gaussians._xyz.device)] = True
-#         except Exception:
-#             return None
-
-#         if protected_mask is not None:
-#             protected_mask = protected_mask.to(device=destination_mask.device, dtype=torch.bool).flatten()
-#             if protected_mask.shape[0] == destination_mask.shape[0]:
-#                 destination_mask = destination_mask & (~protected_mask)
-
-#         if destination_mask.sum().item() == 0:
-#             return None
-
-#         gaussians.prune_points(destination_mask)
-#         print(f"Removed {destination_mask.sum().item()} gaussians in destination area")
-#         return destination_mask
 
 
 def remove_gaussians_in_destination(gaussians, translated_mask3d):
@@ -428,6 +399,9 @@ def finetune_reposition(
     
     mask3d_for_pseudo_repositioned = mask3d_for_optimizer
 
+    # Store the translated foreground mask for two-pass rendering.
+    gaussians.reposition_foreground_mask = target_anchor_mask.clone()
+
     source_neighborhood_mask = points_inside_convex_hull(
         source_xyz_before_translation, source_anchor_mask_original, outlier_factor=1.0
     )
@@ -491,14 +465,14 @@ def finetune_reposition(
         loss = (0.8 - opt.lambda_dssim) * l1 + opt.lambda_dssim * lpips_loss + lambda_ssim * ssim_loss
         loss.backward()
 
-        # with torch.no_grad():
-        #     if iteration < 5000 :
-        #         gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-        #         gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+        with torch.no_grad():
+            if iteration < 5000 :
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-        #         if  iteration % 300 == 0:
-        #             size_threshold = 20 
-        #             gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, cameras_extent, size_threshold)
+                if  iteration % 100 == 0:
+                    size_threshold = 20 
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, cameras_extent, size_threshold)
   
 
         if enable_opacity_blending:
@@ -511,13 +485,6 @@ def finetune_reposition(
 
         gaussians.optimizer.step()
 
-        # cap_covariances_toward_target(
-        #     gaussians,
-        #     finetune_mask,
-        #     target_anchor_mask,
-        #     blend=0.3,
-        #     safety_margin=0.0,
-        # )
         
         gaussians.optimizer.zero_grad(set_to_none=True)
 
@@ -526,27 +493,13 @@ def finetune_reposition(
             progress_bar.update(10)
     progress_bar.close()
 
-    # removed_mask = remove_gaussians_in_destination(
-    #     gaussians,
-    #     source_xyz_before_translation,
-    #     source_anchor_mask_original,
-    #     translation,
-    # )
-    # if removed_mask is not None:
-    #     keep_mask = ~removed_mask
-    #     mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
-    #     target_anchor_mask = target_anchor_mask[keep_mask]
-    #     source_neighborhood_mask = source_neighborhood_mask[keep_mask]
 
-
-    removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
-    if removed_mask is not None:
-            keep_mask = ~removed_mask
-            mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
-            target_anchor_mask = target_anchor_mask[keep_mask]
-            source_neighborhood_mask = source_neighborhood_mask[keep_mask]
-
-    
+    # removed_mask = remove_gaussians_in_destination(gaussians, target_anchor_mask)
+    #                 if removed_mask is not None:
+    #                         keep_mask = ~removed_mask
+    #                         mask3d_for_optimizer = mask3d_for_optimizer[keep_mask]
+    #                         target_anchor_mask = target_anchor_mask[keep_mask]
+    #                         source_neighborhood_mask = source_neighborhood_mask[keep_mask]
 
 
     point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition_copy/iteration_{iteration}")
@@ -566,8 +519,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(gt_colormask_path, exist_ok=True)
     makedirs(pred_obj_path, exist_ok=True)
 
+    fg_mask = getattr(gaussians, "reposition_foreground_mask", None)
+    use_two_pass = fg_mask is not None and fg_mask.numel() == gaussians._xyz.shape[0]
+    # use_two_pass = False
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        results = render(view, gaussians, pipeline, background)
+        if use_two_pass:
+            fg_mask = fg_mask.to(device=gaussians._xyz.device, dtype=torch.bool).flatten()
+            bg_pkg = _render_with_active_mask(view, gaussians, pipeline, background, ~fg_mask)
+            fg_pkg = _render_with_active_mask(view, gaussians, pipeline, background, fg_mask)
+            rendering, rendering_obj = _composite_two_passes(bg_pkg, fg_pkg, background)
+            results = {"render": rendering, "render_object": rendering_obj}
+        else:
+            results = render(view, gaussians, pipeline, background)
         rendering = results["render"]
         rendering_obj = results["render_object"]
         logits = classifier(rendering_obj)
@@ -701,7 +664,7 @@ if __name__ == "__main__":
     parser.add_argument("--translation_dz", type=float, default=0.0, help="Translation in world z-axis")
     parser.add_argument("--pseudo_gt_path", type=str, default="", help="Directory containing pseudo-GT images as <image_name>.png")
     parser.add_argument("--enable_opacity_blending", action="store_true", help="Enable opacity reduction in destination area for better blending")
-    parser.add_argument("--opacity_blend_target", type=float, default=0.05, help="Target opacity for gaussians in destination area")
+    parser.add_argument("--opacity_blend_target", type=float, default=1e-5, help="Target opacity for gaussians in destination area")
     parser.add_argument("--opacity_blend_radius", type=float, default=0.1, help="Radius around translated gaussians to affect for blending")
     parser.add_argument("--keep_original_gaussians", action="store_true", help="Keep the original gaussians in place and duplicate them at the translated location")
 
