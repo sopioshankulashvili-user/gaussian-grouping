@@ -151,10 +151,7 @@ def _composite_two_passes(bg_pkg, fg_pkg, background):
     
     # Use the foreground's actual accumulated opacity (Alpha)
     # Ensure this is [1, H, W]
-    print(fg_pkg.keys())
     fg_alpha = fg_pkg["opacity"] 
-
-    print(f"Foreground alpha stats - min: {fg_alpha.min().item():.6f}, max: {fg_alpha.max().item():.6f}, mean: {fg_alpha.mean().item():.6f}")
 
     # Standard "Over" operator: Result = FG + (1 - Alpha_FG) * BG
     # This assumes FG is already premultiplied (Standard in 3DGS)
@@ -507,7 +504,7 @@ def finetune_reposition(
     return gaussians
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier, fix_boundary_stretching=True, boundary_shrink_factor=0.85):
     render_path = os.path.join(model_path, name, "ours{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt")
     colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_feature16")
@@ -569,21 +566,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         writer.write(result[:, :, ::-1])
 
     writer.release()
-
-
-    # Save composite point cloud (foreground on top of background)
-    if use_two_pass:
-        try:
-            gaussians.save_ply(os.path.join(pointcloud_path, "composite_point_cloud.ply"))
-            print(f"[render_set] Saved composite point cloud to {pointcloud_path}")
-        except Exception as e:
-            print(f"[render_set] Warning: Failed to save composite point cloud: {e}")
-    else:
-        try:
-            gaussians.save_ply(os.path.join(pointcloud_path, "point_cloud.ply"))
-            print(f"[render_set] Saved point cloud to {pointcloud_path}")
-        except Exception as e:
-            print(f"[render_set] Warning: Failed to save point cloud: {e}")
 
 
 
