@@ -513,11 +513,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_feature16")
     gt_colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt_objects_color")
     pred_obj_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_pred")
+    pointcloud_path = os.path.join(model_path, name, "ours{}".format(iteration), "point_cloud")
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(colormask_path, exist_ok=True)
     makedirs(gt_colormask_path, exist_ok=True)
     makedirs(pred_obj_path, exist_ok=True)
+    makedirs(pointcloud_path, exist_ok=True)
 
     fg_mask = getattr(gaussians, "reposition_foreground_mask", None)
     use_two_pass = fg_mask is not None and fg_mask.numel() == gaussians._xyz.shape[0]
@@ -567,6 +569,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         writer.write(result[:, :, ::-1])
 
     writer.release()
+
+
+    # Save composite point cloud (foreground on top of background)
+    if use_two_pass:
+        try:
+            gaussians.save_ply(os.path.join(pointcloud_path, "composite_point_cloud.ply"))
+            print(f"[render_set] Saved composite point cloud to {pointcloud_path}")
+        except Exception as e:
+            print(f"[render_set] Warning: Failed to save composite point cloud: {e}")
+    else:
+        try:
+            gaussians.save_ply(os.path.join(pointcloud_path, "point_cloud.ply"))
+            print(f"[render_set] Saved point cloud to {pointcloud_path}")
+        except Exception as e:
+            print(f"[render_set] Warning: Failed to save point cloud: {e}")
+
 
 
 def reposition(
