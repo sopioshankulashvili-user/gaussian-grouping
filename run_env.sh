@@ -23,7 +23,7 @@ source /data/sopio/miniconda3/bin/activate
 # conda create -n gaussian_grouping python=3.8 -y
 conda activate gaussian_grouping
 
-rm -rf submodules/*/build/ submodules/*/dist/ submodules/*/*.egg-info
+# rm -rf submodules/*/build/ submodules/*/dist/ submodules/*/*.egg-info
 
 export CUDA_HOME=/data/sopio/miniconda3/envs/gaussian_grouping
 export CPATH=$CUDA_HOME/targets/x86_64-linux/include:$CPATH
@@ -36,13 +36,13 @@ export PATH=$CUDA_HOME/bin:$PATH
 # pip install plyfile==0.8.1
 # pip install tqdm scipy wandb opencv-python scikit-learn lpips
 
-conda install -c conda-forge gcc=9.4.0 gxx=9.4.0 ninja libxcrypt
+# conda install -c conda-forge gcc=9.4.0 gxx=9.4.0 ninja libxcrypt
 
 export TORCH_CUDA_ARCH_LIST="7.5 8.6"
 export LDFLAGS="-L/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu"
-pip uninstall diff-gaussian-rasterization simple-knn -y
+# pip uninstall diff-gaussian-rasterization simple-knn -y
 pip install submodules/diff-gaussian-rasterization
-pip install submodules/simple-knn
+# pip install submodules/simple-knn
 
 
 # python convert.py -s /data/sopio/datasets/annotated_small_city_45/45

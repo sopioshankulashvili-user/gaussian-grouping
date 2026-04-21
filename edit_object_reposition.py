@@ -286,10 +286,7 @@ def _composite_two_passes(bg_pkg, fg_pkg, background):
     
     # Use the foreground's actual accumulated opacity (Alpha)
     # Ensure this is [1, H, W]
-    print(fg_pkg.keys())
     fg_alpha = fg_pkg["opacity"] 
-
-    print(f"Foreground alpha stats - min: {fg_alpha.min().item():.6f}, max: {fg_alpha.max().item():.6f}, mean: {fg_alpha.mean().item():.6f}")
 
     # Standard "Over" operator: Result = FG + (1 - Alpha_FG) * BG
     # This assumes FG is already premultiplied (Standard in 3DGS)
@@ -661,17 +658,19 @@ def finetune_reposition(
     return gaussians
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier, fix_boundary_stretching=True, boundary_shrink_factor=0.85):
     render_path = os.path.join(model_path, name, "ours{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt")
     colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_feature16")
     gt_colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt_objects_color")
     pred_obj_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_pred")
+    pointcloud_path = os.path.join(model_path, name, "ours{}".format(iteration), "point_cloud")
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(colormask_path, exist_ok=True)
     makedirs(gt_colormask_path, exist_ok=True)
     makedirs(pred_obj_path, exist_ok=True)
+    makedirs(pointcloud_path, exist_ok=True)
 
     fg_mask = getattr(gaussians, "reposition_foreground_mask", None)
     use_two_pass = fg_mask is not None and fg_mask.numel() == gaussians._xyz.shape[0]
@@ -721,6 +720,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         writer.write(result[:, :, ::-1])
 
     writer.release()
+
 
 
 def reposition(
