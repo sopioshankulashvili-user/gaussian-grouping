@@ -80,6 +80,141 @@ def apply_translation_to_selected_gaussians(gaussians, mask3d, translation):
         gaussians._xyz.data[mask3d] = gaussians._xyz.data[mask3d] + translation_tensor
 
 
+def _normalize_quaternions(quaternions):
+    return quaternions / torch.clamp(torch.norm(quaternions, dim=1, keepdim=True), min=1e-12)
+
+
+def _quaternion_multiply(q1, q2):
+    """Multiply two batches of quaternions in (w, x, y, z) format."""
+    w1, x1, y1, z1 = q1.unbind(dim=1)
+    w2, x2, y2, z2 = q2.unbind(dim=1)
+
+    return torch.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dim=1,
+    )
+
+
+def _euler_degrees_to_quaternion(rotation_degrees, device, dtype):
+    rotation_tensor = torch.as_tensor(rotation_degrees, dtype=dtype, device=device).flatten()
+    if rotation_tensor.numel() != 3:
+        raise ValueError("Rotation must contain exactly three values: [rx, ry, rz].")
+
+    if rotation_tensor.abs().sum().item() == 0:
+        return torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=dtype, device=device)
+
+    rotation_radians = torch.deg2rad(rotation_tensor)
+    half_angles = rotation_radians * 0.5
+    zero = torch.zeros((), dtype=dtype, device=device)
+
+    qx = torch.stack([torch.cos(half_angles[0]), torch.sin(half_angles[0]), zero, zero]).unsqueeze(0)
+    qy = torch.stack([torch.cos(half_angles[1]), zero, torch.sin(half_angles[1]), zero]).unsqueeze(0)
+    qz = torch.stack([torch.cos(half_angles[2]), zero, zero, torch.sin(half_angles[2])]).unsqueeze(0)
+
+    # Apply rotations in X -> Y -> Z order.
+    q = _quaternion_multiply(_quaternion_multiply(qz, qy), qx)
+    return _normalize_quaternions(q)[0]
+
+
+def _apply_rotation_to_gaussian_subset(gaussians, mask3d, rotation_degrees, translate_center=None):
+    rotation_tensor = torch.as_tensor(rotation_degrees, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
+    if rotation_tensor.abs().sum().item() == 0:
+        return None
+
+    selected_xyz = gaussians._xyz.data[mask3d].detach().clone()
+    if selected_xyz.shape[0] == 0:
+        return None
+
+    if translate_center is None:
+        center = selected_xyz.mean(dim=0)
+    else:
+        center = torch.as_tensor(translate_center, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
+
+    delta_quaternion = _euler_degrees_to_quaternion(rotation_tensor, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
+    delta_quaternion = delta_quaternion.unsqueeze(0)
+    rotation_matrix = _quaternion_to_rotation_matrix(delta_quaternion)[0]
+
+    with torch.no_grad():
+        centered_xyz = selected_xyz - center.unsqueeze(0)
+        rotated_xyz = centered_xyz @ rotation_matrix.t() + center.unsqueeze(0)
+        gaussians._xyz.data[mask3d] = rotated_xyz
+
+        selected_rotation = gaussians._rotation.data[mask3d].detach().clone()
+        if selected_rotation.shape[1] != 4:
+            raise ValueError("Gaussian rotations are expected to be quaternions with four components.")
+
+        delta_quaternion_batch = delta_quaternion.expand(selected_rotation.shape[0], -1)
+        rotated_quaternion = _quaternion_multiply(delta_quaternion_batch, selected_rotation)
+        gaussians._rotation.data[mask3d] = _normalize_quaternions(rotated_quaternion)
+
+    return center
+
+
+def apply_rotation_to_selected_gaussians(gaussians, mask3d, rotation_degrees):
+    _apply_rotation_to_gaussian_subset(gaussians, mask3d, rotation_degrees)
+
+
+def duplicate_and_rotate_selected_gaussians(gaussians, mask3d, rotation_degrees):
+    """
+    Keep the original gaussians in place and create a rotated duplicate copy.
+
+    Returns:
+        train_mask_expanded: Bool mask of length N+M for optimization.
+            Marks original selected gaussians and rotated duplicates.
+        rotated_only_mask: Bool mask of length N+M marking only rotated duplicates.
+    """
+    rotation_tensor = torch.as_tensor(rotation_degrees, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
+    n_original = gaussians._xyz.shape[0]
+    n_selected = int(mask3d.sum().item())
+
+    if rotation_tensor.abs().sum().item() == 0 or n_selected == 0:
+        rotated_only_mask = torch.zeros_like(mask3d, dtype=torch.bool)
+        return mask3d, rotated_only_mask
+
+    with torch.no_grad():
+        selected_xyz = gaussians._xyz[mask3d].detach().clone()
+        center = selected_xyz.mean(dim=0)
+        delta_quaternion = _euler_degrees_to_quaternion(rotation_tensor, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
+        rotation_matrix = _quaternion_to_rotation_matrix(delta_quaternion.unsqueeze(0))[0]
+
+        xyz_new = (selected_xyz - center.unsqueeze(0)) @ rotation_matrix.t() + center.unsqueeze(0)
+        features_dc_new = gaussians._features_dc[mask3d].detach().clone()
+        features_rest_new = gaussians._features_rest[mask3d].detach().clone()
+        opacity_new = gaussians._opacity[mask3d].detach().clone()
+        scaling_new = gaussians._scaling[mask3d].detach().clone()
+        rotation_new = gaussians._rotation[mask3d].detach().clone()
+        objects_dc_new = gaussians._objects_dc[mask3d].detach().clone()
+
+        delta_quaternion_batch = delta_quaternion.unsqueeze(0).expand(rotation_new.shape[0], -1)
+        rotation_new = _normalize_quaternions(_quaternion_multiply(delta_quaternion_batch, rotation_new))
+
+        gaussians._xyz = torch.nn.Parameter(torch.cat([gaussians._xyz.detach(), xyz_new], dim=0).requires_grad_(True))
+        gaussians._features_dc = torch.nn.Parameter(
+            torch.cat([gaussians._features_dc.detach(), features_dc_new], dim=0).requires_grad_(True)
+        )
+        gaussians._features_rest = torch.nn.Parameter(
+            torch.cat([gaussians._features_rest.detach(), features_rest_new], dim=0).requires_grad_(True)
+        )
+        gaussians._opacity = torch.nn.Parameter(torch.cat([gaussians._opacity.detach(), opacity_new], dim=0).requires_grad_(True))
+        gaussians._scaling = torch.nn.Parameter(torch.cat([gaussians._scaling.detach(), scaling_new], dim=0).requires_grad_(True))
+        gaussians._rotation = torch.nn.Parameter(torch.cat([gaussians._rotation.detach(), rotation_new], dim=0).requires_grad_(True))
+        gaussians._objects_dc = torch.nn.Parameter(torch.cat([gaussians._objects_dc.detach(), objects_dc_new], dim=0).requires_grad_(True))
+
+    train_mask_expanded = torch.zeros((n_original + n_selected), device=mask3d.device, dtype=torch.bool)
+    train_mask_expanded[:n_original] = mask3d
+    train_mask_expanded[n_original:] = True
+
+    rotated_only_mask = torch.zeros((n_original + n_selected), device=mask3d.device, dtype=torch.bool)
+    rotated_only_mask[n_original:] = True
+
+    return train_mask_expanded, rotated_only_mask
+
+
 def duplicate_and_translate_selected_gaussians(gaussians, mask3d, translation):
     """
     Keep the original gaussians in place and create a translated duplicate copy.
@@ -368,6 +503,7 @@ def finetune_reposition(
     removal_thresh,
     finetune_iteration,
     translation,
+    rotation,
     pseudo_gt_path,
     lambda_ssim=0.2,
     enable_opacity_blending=False,
@@ -389,12 +525,30 @@ def finetune_reposition(
 
     source_anchor_mask_original = mask3d.clone()
     target_anchor_mask = mask3d
+
+    has_translation = np.abs(np.asarray(translation, dtype=np.float32)).sum() > 0
+    has_rotation = np.abs(np.asarray(rotation, dtype=np.float32)).sum() > 0
+
     if keep_original_gaussians:
-        mask3d_for_optimizer, target_anchor_mask = duplicate_and_translate_selected_gaussians(
-            gaussians, mask3d, translation
-        )
+        if has_translation:
+            mask3d_for_optimizer, target_anchor_mask = duplicate_and_translate_selected_gaussians(
+                gaussians, mask3d, translation
+            )
+        else:
+            mask3d_for_optimizer = mask3d
+
+        if has_rotation:
+            if has_translation:
+                apply_rotation_to_selected_gaussians(gaussians, target_anchor_mask, rotation)
+            else:
+                mask3d_for_optimizer, target_anchor_mask = duplicate_and_rotate_selected_gaussians(
+                    gaussians, mask3d, rotation
+                )
     else:
-        apply_translation_to_selected_gaussians(gaussians, mask3d, translation)
+        if has_translation:
+            apply_translation_to_selected_gaussians(gaussians, mask3d, translation)
+        if has_rotation:
+            apply_rotation_to_selected_gaussians(gaussians, mask3d, rotation)
         mask3d_for_optimizer = mask3d
     
     mask3d_for_pseudo_repositioned = mask3d_for_optimizer
@@ -580,6 +734,7 @@ def reposition(
     removal_thresh: float,
     finetune_iteration: int,
     translation,
+    rotation,
     pseudo_gt_path,
     enable_opacity_blending: bool = False,
     opacity_blend_target: float = 0.0,
@@ -611,6 +766,7 @@ def reposition(
         removal_thresh,
         finetune_iteration,
         translation,
+        rotation,
         pseudo_gt_path,
         lambda_ssim=getattr(opt, "reposition_lambda_ssim", 0.2),
         enable_opacity_blending=enable_opacity_blending,
@@ -662,11 +818,14 @@ if __name__ == "__main__":
     parser.add_argument("--translation_dx", type=float, default=0.0, help="Translation in world x-axis")
     parser.add_argument("--translation_dy", type=float, default=0.0, help="Translation in world y-axis")
     parser.add_argument("--translation_dz", type=float, default=0.0, help="Translation in world z-axis")
+    parser.add_argument("--rotation_rx", type=float, default=0.0, help="Rotation around world x-axis in degrees")
+    parser.add_argument("--rotation_ry", type=float, default=0.0, help="Rotation around world y-axis in degrees")
+    parser.add_argument("--rotation_rz", type=float, default=0.0, help="Rotation around world z-axis in degrees")
     parser.add_argument("--pseudo_gt_path", type=str, default="", help="Directory containing pseudo-GT images as <image_name>.png")
     parser.add_argument("--enable_opacity_blending", action="store_true", help="Enable opacity reduction in destination area for better blending")
     parser.add_argument("--opacity_blend_target", type=float, default=1e-5, help="Target opacity for gaussians in destination area")
     parser.add_argument("--opacity_blend_radius", type=float, default=0.1, help="Radius around translated gaussians to affect for blending")
-    parser.add_argument("--keep_original_gaussians", action="store_true", help="Keep the original gaussians in place and duplicate them at the translated location")
+    parser.add_argument("--keep_original_gaussians", action="store_true", help="Keep the original gaussians in place and duplicate them at the transformed location")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -703,6 +862,18 @@ if __name__ == "__main__":
         args.translation_dy = config.get("translation_dy", args.translation_dy)
         args.translation_dz = config.get("translation_dz", args.translation_dz)
 
+    cfg_rotation = config.get("rotation", None)
+    if cfg_rotation is not None:
+        if not isinstance(cfg_rotation, list) or len(cfg_rotation) != 3:
+            raise ValueError("Config key 'rotation' must be a list [rx, ry, rz] in degrees.")
+        args.rotation_rx = float(cfg_rotation[0])
+        args.rotation_ry = float(cfg_rotation[1])
+        args.rotation_rz = float(cfg_rotation[2])
+    else:
+        args.rotation_rx = config.get("rotation_rx", args.rotation_rx)
+        args.rotation_ry = config.get("rotation_ry", args.rotation_ry)
+        args.rotation_rz = config.get("rotation_rz", args.rotation_rz)
+
     args.pseudo_gt_path = config.get("pseudo_gt_path", args.pseudo_gt_path)
 
     args.enable_opacity_blending = config.get("enable_opacity_blending", args.enable_opacity_blending)
@@ -711,7 +882,9 @@ if __name__ == "__main__":
     args.keep_original_gaussians = config.get("keep_original_gaussians", args.keep_original_gaussians)
 
     translation = [args.translation_dx, args.translation_dy, args.translation_dz]
+    rotation = [args.rotation_rx, args.rotation_ry, args.rotation_rz]
     print(f"Using translation: {translation}")
+    print(f"Using rotation (degrees): {rotation}")
     print(f"Pseudo-GT path: {args.pseudo_gt_path}")
 
     safe_state(args.quiet)
@@ -727,6 +900,7 @@ if __name__ == "__main__":
         args.removal_thresh,
         args.finetune_iteration,
         translation,
+        rotation,
         args.pseudo_gt_path,
         enable_opacity_blending=args.enable_opacity_blending,
         opacity_blend_target=args.opacity_blend_target,
