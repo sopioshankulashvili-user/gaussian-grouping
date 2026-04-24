@@ -1,0 +1,15 @@
+{
+  "num_classes": 3,
+  "select_obj_id": [2],
+  "removal_thresh": 0.7,
+  "images": "/data/sopio/small_city_50/crack_5/images",
+  "object_path": "/data/sopio/small_city_50/crack_5/object_mask",
+  "r": 1,
+  "lambda_dlpips": 0.5,
+  "reposition_lambda_ssim": 0.2,
+  "finetune_iteration": 7000,
+  "translation": [-0.07, 0.0, 0.0],
+  "pseudo_gt_path": "/data/sopio/small_city_50/crack_5/inpainted",
+  "enable_opacity_blending": false,
+  "keep_original_gaussians": true
+}
