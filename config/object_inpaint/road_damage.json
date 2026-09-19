@@ -1,11 +1,12 @@
 {
     "num_classes": 3,
-    "removal_thresh": 0.4,
+    "removal_thresh": 0.7,
     "select_obj_id" : [2],
-    "images": "/data/sopio/small_city_50/25_inpainted/images",
-    "object_path" : "/data/sopio/small_city_50/25/object_mask",
+    "images": "/data/sopio/milan/4/inpainted",
+    "object_path" : "/data/sopio/milan/4/object_mask",
+    "road_mask_path" : "object_mask_road",
     "r" : 1,
-    "lambda_dlpips" : 0.4,
-    "finetune_iteration": 7000,
+    "lambda_dlpips" : 0.7,
+    "finetune_iteration": 1000,
     "flattened_road": false
 }

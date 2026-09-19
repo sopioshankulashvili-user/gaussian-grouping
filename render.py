@@ -22,6 +22,11 @@ from PIL import Image
 import colorsys
 import cv2
 from sklearn.decomposition import PCA
+from time import time
+from pathlib import Path
+import imageio
+from utils.camera_utils import generate_interpolated_path, visualizer
+from scene.dataset_readers import loadCameras
 
 def feature_to_rgb(features):
     # Input features shape: (16, H, W)
@@ -82,7 +87,85 @@ def confidence_to_heatmap(confidence_map):
     return heatmap_rgb
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier):
+def save_interpolate_pose(model_path, iter, num_views):
+    """Generate smooth interpolated camera poses from optimized poses.
+    
+    Args:
+        model_path: Path to model directory
+        iter: Iteration number
+        num_views: Number of keyframe views
+    """
+    org_pose = np.load(model_path / f"pose/ours_{iter}/pose_optimized.npy")
+    visualizer(org_pose, ["green" for _ in org_pose], model_path / f"pose/ours_{iter}/poses_optimized.png")
+    
+    n_interp = int(10 * 30 / num_views)  # 10 seconds, fps=30
+    all_inter_pose = []
+    for i in range(num_views-1):
+        tmp_inter_pose = generate_interpolated_path(poses=org_pose[i:i+2], n_interp=n_interp)
+        all_inter_pose.append(tmp_inter_pose)
+    all_inter_pose = np.concatenate(all_inter_pose, axis=0)
+    all_inter_pose = np.concatenate([all_inter_pose, org_pose[-1][:3, :].reshape(1, 3, 4)], axis=0)
+
+    theta = np.radians(30)
+    c, s = np.cos(theta), np.sin(theta)
+
+    # # around y axis
+    # R_y = np.array([
+    #     [ c, 0, s, 0],
+    #     [ 0, 1, 0, 0],
+    #     [-s, 0, c, 0],
+    #     [ 0, 0, 0, 1]
+    # ])
+
+    # around x axis
+    R_x = np.array([
+        [1,  0, 0, 0],
+        [0,  c, -s, 0],
+        [0,  s, c, 0],
+        [0,  0, 0, 1]
+    ])
+
+    # # around z axis
+    # R_z = np.array([
+    #     [c, -s, 0, 0],
+    #     [s,  c, 0, 0],
+    #     [0,  0, 1, 0],
+    #     [0,  0, 0, 1]
+    # ])
+
+
+    inter_pose_list = []
+    for p in all_inter_pose:
+        tmp_view = np.eye(4)
+        tmp_view[:3, :3] = p[:3, :3]
+        tmp_view[:3, 3] = p[:3, 3]
+        # tmp_view = tmp_view @ R_x
+
+        inter_pose_list.append(tmp_view)
+    inter_pose = np.stack(inter_pose_list, 0)
+    visualizer(inter_pose, ["blue" for _ in inter_pose], model_path / f"pose/ours_{iter}/poses_interpolated.png")
+    np.save(model_path / f"pose/ours_{iter}/pose_interpolated.npy", inter_pose)
+
+
+def images_to_video(image_folder, output_video_path, fps=30):
+    """Convert images in a folder to a video.
+
+    Args:
+        image_folder (str): Path to folder containing images.
+        output_video_path (str): Path where output video will be saved.
+        fps (int): Frames per second for output video.
+    """
+    images = []
+    for filename in sorted(os.listdir(image_folder)):
+        if filename.endswith(('.png', '.jpg', '.jpeg', '.JPG', '.PNG')):
+            image_path = os.path.join(image_folder, filename)
+            image = imageio.imread(image_path)
+            images.append(image)
+
+    imageio.mimwrite(output_video_path, images, fps=fps)
+
+
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier, is_interpolated=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     colormask_path = os.path.join(model_path, name, "ours_{}".format(iteration), "objects_feature16")
@@ -90,11 +173,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     pred_obj_path = os.path.join(model_path, name, "ours_{}".format(iteration), "objects_pred")
     confidence_heatmap_path = os.path.join(model_path, name, "ours_{}".format(iteration), "objects_confidence_heatmap")
     makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
     makedirs(colormask_path, exist_ok=True)
-    makedirs(gt_colormask_path, exist_ok=True)
     makedirs(pred_obj_path, exist_ok=True)
     makedirs(confidence_heatmap_path, exist_ok=True)
+    
+    # Only create GT-related directories for non-interpolated renders
+    if not is_interpolated:
+        makedirs(gts_path, exist_ok=True)
+        makedirs(gt_colormask_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         results = render(view, gaussians, pipeline, background)
@@ -107,44 +193,51 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))
         confidence_heatmap = confidence_to_heatmap(confidence_map)
         
-
-        gt_objects = view.objects
-        gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
-
         rgb_mask = feature_to_rgb(rendering_obj)
         Image.fromarray(rgb_mask).save(os.path.join(colormask_path, '{0:05d}'.format(idx) + ".png"))
-        Image.fromarray(gt_rgb_mask).save(os.path.join(gt_colormask_path, '{0:05d}'.format(idx) + ".png"))
         Image.fromarray(pred_obj_mask).save(os.path.join(pred_obj_path, '{0:05d}'.format(idx) + ".png"))
         Image.fromarray(confidence_heatmap).save(os.path.join(confidence_heatmap_path, '{0:05d}'.format(idx) + ".png"))
-        gt = view.original_image[0:3, :, :]
+        
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        
+        # Save GT images only for non-interpolated renders
+        if not is_interpolated:
+            gt_objects = view.objects
+            gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
+            Image.fromarray(gt_rgb_mask).save(os.path.join(gt_colormask_path, '{0:05d}'.format(idx) + ".png"))
+            gt = view.original_image[0:3, :, :]
+            torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
-    out_path = os.path.join(render_path[:-8],'concat')
-    makedirs(out_path,exist_ok=True)
-    fourcc = cv2.VideoWriter.fourcc(*'DIVX') 
-    size = (gt.shape[-1]*6,gt.shape[-2])
-    fps = float(5) if 'train' in out_path else float(1)
-    writer = cv2.VideoWriter(os.path.join(out_path,'result.mp4'), fourcc, fps, size)
+    # Create concatenated output video only for non-interpolated renders
+    if not is_interpolated:
+        out_path = os.path.join(render_path[:-8],'concat')
+        makedirs(out_path,exist_ok=True)
+        fourcc = cv2.VideoWriter.fourcc(*'DIVX') 
+        size = (gt.shape[-1]*6,gt.shape[-2])
+        fps = float(5) if 'train' in out_path else float(1)
+        writer = cv2.VideoWriter(os.path.join(out_path,'result.mp4'), fourcc, fps, size)
 
-    for file_name in sorted(os.listdir(gts_path)):
-        gt = np.array(Image.open(os.path.join(gts_path,file_name)))
-        rgb = np.array(Image.open(os.path.join(render_path,file_name)))
-        gt_obj = np.array(Image.open(os.path.join(gt_colormask_path,file_name)))
-        render_obj = np.array(Image.open(os.path.join(colormask_path,file_name)))
-        pred_obj = np.array(Image.open(os.path.join(pred_obj_path,file_name)))
-        conf_heat = np.array(Image.open(os.path.join(confidence_heatmap_path,file_name)))
+        for file_name in sorted(os.listdir(gts_path)):
+            gt = np.array(Image.open(os.path.join(gts_path,file_name)))
+            rgb = np.array(Image.open(os.path.join(render_path,file_name)))
+            gt_obj = np.array(Image.open(os.path.join(gt_colormask_path,file_name)))
+            render_obj = np.array(Image.open(os.path.join(colormask_path,file_name)))
+            pred_obj = np.array(Image.open(os.path.join(pred_obj_path,file_name)))
+            conf_heat = np.array(Image.open(os.path.join(confidence_heatmap_path,file_name)))
 
-        result = np.hstack([gt,rgb,gt_obj,pred_obj,render_obj,conf_heat])
-        result = result.astype('uint8')
+            result = np.hstack([gt,rgb,gt_obj,pred_obj,render_obj,conf_heat])
+            result = result.astype('uint8')
 
-        Image.fromarray(result).save(os.path.join(out_path,file_name))
-        writer.write(result[:,:,::-1])
+            Image.fromarray(result).save(os.path.join(out_path,file_name))
+            writer.write(result[:,:,::-1])
 
-    writer.release()
+        writer.release()
+    else:
+        # For interpolated renders, create a simple video from rendered images only
+        images_to_video(render_path, os.path.join(render_path[:-8], f'{name}_interp_video.mp4'), fps=30)
 
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, args=None):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -165,6 +258,26 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         if (not skip_test) and (len(scene.getTestCameras()) > 0):
              render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, classifier)
 
+        # Render interpolated poses for smooth video generation if available
+        if args and hasattr(args, 'infer_video') and args.infer_video and not dataset.eval:
+            try:
+                save_interpolate_pose(Path(dataset.model_path), iterations, args.num_views) # changed iterations to 7000
+                interp_pose = np.load(Path(dataset.model_path) / 'pose' / f'ours_{iteration}' / 'pose_interpolated.npy')
+                viewpoint_stack = loadCameras(interp_pose, scene.getTrainCameras())
+                render_set(
+                    dataset.model_path,
+                    "interp",
+                    scene.loaded_iter,
+                    viewpoint_stack,
+                    gaussians,
+                    pipeline,
+                    background,
+                    classifier,
+                    is_interpolated=True
+                )
+            except Exception as e:
+                print(f"Warning: Could not render interpolated poses: {e}")
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
@@ -174,10 +287,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--infer_video", action="store_true", help="Generate interpolated video with smooth camera poses")
+    parser.add_argument("--num_views", default=10, type=int, help="Number of keyframe views for interpolation")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args)

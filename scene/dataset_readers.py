@@ -19,6 +19,9 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import copy
+import torch
+
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -62,6 +65,37 @@ def getNerfppNorm(cam_info):
     translate = -center
 
     return {"translate": translate, "radius": radius}
+
+def loadCameras(poses, viewpoint_stack):
+
+    # load optimized poses
+    if poses.shape[0] == len(viewpoint_stack):
+        for idx, cam in enumerate(viewpoint_stack):
+            R = np.transpose(poses[idx][:3, :3])
+            T = poses[idx][:3, 3]
+            cam.R = R
+            cam.T = T
+            cam.world_view_transform = torch.tensor(getWorld2View2(R, T)).transpose(0, 1).cuda()
+            cam.full_proj_transform = (cam.world_view_transform.unsqueeze(0).bmm(cam.projection_matrix.unsqueeze(0))).squeeze(0)
+            cam.camera_center = cam.world_view_transform.inverse()[3, :3]
+
+    # load interpolated poses
+    elif poses.shape[0] > len(viewpoint_stack):
+        repeat_times = int(np.ceil(poses.shape[0] / len(viewpoint_stack)))
+        # Create repeated list instead of using np.tile
+        viewpoint_stack = [copy.deepcopy(vp) for vp in viewpoint_stack * repeat_times][:poses.shape[0]]
+        for idx in range(poses.shape[0]):                                 
+            R = np.transpose(poses[idx][:3, :3])
+            T = poses[idx][:3, 3]
+            viewpoint_stack[idx].uid = idx           
+            viewpoint_stack[idx].colmap_id = idx+1    
+            viewpoint_stack[idx].image_name = str(idx).zfill(5)    
+            viewpoint_stack[idx].R = R
+            viewpoint_stack[idx].T = T            
+            viewpoint_stack[idx].world_view_transform = torch.tensor(getWorld2View2(R, T)).transpose(0, 1).cuda()
+            viewpoint_stack[idx].full_proj_transform = (viewpoint_stack[idx].world_view_transform.unsqueeze(0).bmm(viewpoint_stack[idx].projection_matrix.unsqueeze(0))).squeeze(0)
+            viewpoint_stack[idx].camera_center = viewpoint_stack[idx].world_view_transform.inverse()[3, :3]
+    return viewpoint_stack
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, objects_folder):
     cam_infos = []

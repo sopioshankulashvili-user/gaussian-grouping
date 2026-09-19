@@ -25,6 +25,7 @@ import json
 from pathlib import Path
 from PIL import Image
 import numpy as np
+import scipy.interpolate
 from utils.graphics_utils import geom_transform_points
 from height_constraint import (
     detect_flat_surface_height,
@@ -33,6 +34,66 @@ from height_constraint import (
     fit_plane_to_points_axis_agnostic,
     compute_constraint_values_along_normal
 )
+
+import torch.nn.functional as F
+
+def compute_miou(pred, target, num_classes):
+    """
+    Computes the mean Intersection over Union (mIoU) for a single frame.
+    """
+    # Flatten the 2D tensors to 1D
+    pred = pred.view(-1)
+    target = target.view(-1)
+    
+    # Create a mask to ignore invalid labels (e.g., negative indices or out of bounds)
+    mask = (target >= 0) & (target < num_classes)
+    pred = pred[mask]
+    target = target[mask]
+    
+    # Build a confusion matrix using bincount
+    hist = torch.bincount(
+        num_classes * target + pred, 
+        minlength=num_classes**2
+    ).reshape(num_classes, num_classes)
+    
+    # Intersection is the diagonal; Union is sum of row + sum of col - diagonal
+    intersection = torch.diag(hist)
+    union = hist.sum(dim=1) + hist.sum(dim=0) - intersection
+    
+    # Avoid division by zero for classes not present in the prediction/ground-truth
+    valid = union > 0
+    iou = intersection[valid] / union[valid]
+    
+    # Return the mean of valid classes
+    return iou.mean().item()
+
+class MultiClassDiceLoss(torch.nn.Module):
+    def __init__(self, smooth=1e-5):
+        super(MultiClassDiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        # logits shape: [Batch, Classes, Height, Width]
+        # targets shape: [Batch, Height, Width]
+        num_classes = logits.shape[1]
+        
+        # 1. Convert raw logits to probabilities
+        probs = F.softmax(logits, dim=1)
+        
+        # 2. One-hot encode targets to match probability shape
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        
+        # 3. Calculate Intersection and Union (Cardinality) per class
+        # Sum over spatial dimensions (Height, Width)
+        dims = (2, 3) 
+        intersection = torch.sum(probs * targets_one_hot, dim=dims)
+        cardinality = torch.sum(probs + targets_one_hot, dim=dims)
+        
+        # 4. Compute Dice Score and return Loss (1 - Score)
+        dice_score = (2. * intersection + self.smooth) / (cardinality + self.smooth)
+        
+        # Average the loss across all classes and the batch
+        return 1. - dice_score.mean()
 
 
 class RoadConstraintManager:
@@ -185,15 +246,99 @@ def trim_above_plane_from_mask(gaussians, protect_mask, above_margin=0.0):
     safe_mask = signed_distance <= float(above_margin)
     return protect_mask.to(device=xyz.device, dtype=torch.bool) & safe_mask
 
+
+def _camera_to_c2w(camera):
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = camera.R.transpose()
+    c2w[:3, 3] = -camera.R.transpose() @ camera.T
+    return c2w
+
+
+def save_pose(path, train_cams):
+    ordered_cams = sorted(train_cams, key=lambda cam: cam.colmap_id)
+    poses = np.stack([_camera_to_c2w(cam) for cam in ordered_cams], axis=0)
+    np.save(path, poses)
+
+
+def _normalize(x):
+    return x / np.linalg.norm(x)
+
+
+def _viewmatrix(lookdir, up, position):
+    vec2 = _normalize(lookdir)
+    vec0 = _normalize(np.cross(up, vec2))
+    vec1 = _normalize(np.cross(vec2, vec0))
+    return np.stack([vec0, vec1, vec2, position], axis=1)
+
+
+def generate_interpolated_path(poses, n_interp, spline_degree=5, smoothness=.03, rot_weight=.1):
+    def poses_to_points(poses, dist):
+        pos = poses[:, :3, -1]
+        lookat = poses[:, :3, -1] - dist * poses[:, :3, 2]
+        up = poses[:, :3, -1] + dist * poses[:, :3, 1]
+        return np.stack([pos, lookat, up], 1)
+
+    def points_to_poses(points):
+        return np.array([_viewmatrix(p - l, u - p, p) for p, l, u in points])
+
+    def interp(points, n, k, s):
+        sh = points.shape
+        pts = np.reshape(points, (sh[0], -1))
+        k = min(k, sh[0] - 1)
+        tck, _ = scipy.interpolate.splprep(pts.T, k=k, s=s)
+        u = np.linspace(0, 1, n, endpoint=False)
+        new_points = np.array(scipy.interpolate.splev(u, tck))
+        new_points = np.reshape(new_points.T, (n, sh[1], sh[2]))
+        return new_points
+
+    points = poses_to_points(poses, dist=rot_weight)
+    new_points = interp(points, n_interp * (points.shape[0] - 1), k=spline_degree, s=smoothness)
+    return points_to_poses(new_points)
+
+
+def save_interpolate_pose(model_path, iteration, n_views):
+    pose_dir = os.path.join(model_path, "pose", f"ours_{iteration}")
+    org_pose_path = os.path.join(pose_dir, "pose_optimized.npy")
+    if not os.path.exists(org_pose_path):
+        return
+
+    org_pose = np.load(org_pose_path)
+    n_interp = max(1, int(10 * 30 / max(1, n_views)))
+    all_inter_pose = []
+    for i in range(max(0, org_pose.shape[0] - 1)):
+        tmp_inter_pose = generate_interpolated_path(poses=org_pose[i:i + 2], n_interp=n_interp)
+        all_inter_pose.append(tmp_inter_pose)
+
+    if len(all_inter_pose) == 0:
+        np.save(os.path.join(pose_dir, "pose_interpolated.npy"), org_pose)
+        return
+
+    all_inter_pose = np.concatenate(all_inter_pose, axis=0)
+    all_inter_pose = np.concatenate([all_inter_pose, org_pose[-1][:3, :].reshape(1, 3, 4)], axis=0)
+
+    inter_pose_list = []
+    for p in all_inter_pose:
+        tmp_view = np.eye(4, dtype=np.float32)
+        tmp_view[:3, :3] = p[:3, :3]
+        tmp_view[:3, 3] = p[:3, 3]
+        inter_pose_list.append(tmp_view)
+
+    inter_pose = np.stack(inter_pose_list, 0)
+    np.save(os.path.join(pose_dir, "pose_interpolated.npy"), inter_pose)
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
     prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    train_cams_init = scene.getTrainCameras().copy()
     gaussians.training_setup(opt)
     num_classes = dataset.num_classes
     print("Num classes: ",num_classes)
     classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
+    # cls_criterion = MultiClassDiceLoss(smooth=1e-5) # <-- Replaced here
+    # cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+    # classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
     cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
     classifier.cuda()
@@ -299,6 +444,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
         loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
 
+        # loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0))
+
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
@@ -356,11 +503,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, use_wandb, classifier, num_classes, render_pkg)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 torch.save(classifier.state_dict(), os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),'classifier.pth'))
+                pose_dir = os.path.join(scene.model_path, "pose", f"ours_{iteration}")
+                os.makedirs(pose_dir, exist_ok=True)
+                save_pose(os.path.join(pose_dir, "pose_optimized.npy"), train_cams_init)
+                save_interpolate_pose(scene.model_path, iteration, getattr(dataset, "n_views", len(train_cams_init)))
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -482,7 +633,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, use_wandb, classifier, num_classes, render_pkg):
 
     if use_wandb:
         if loss_obj_3d:
@@ -500,19 +651,52 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                miou_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    
+                    # Calculate per-view metrics
+                    view_l1 = l1_loss(image, gt_image).mean().double()
+                    view_psnr = psnr(image, gt_image).mean().double()
+                    
+                    # Print per-view details
+                    print(f"[{config['name'].upper()}] Image ID: {viewpoint.image_name} | PSNR: {view_psnr:.4f}")
+                    
                     if use_wandb:
                         if idx < 5:
                             wandb.log({config['name'] + "_view_{}/render".format(viewpoint.image_name): [wandb.Image(image)]})
                             if iteration == testing_iterations[0]:
                                 wandb.log({config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name): [wandb.Image(gt_image)]})
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    # l1_test += l1_loss(image, gt_image).mean().double()
+                    # psnr_test += psnr(image, gt_image).mean().double()
+
+                    # Add to totals for the average calculation later
+                    l1_test += view_l1
+                    psnr_test += view_psnr
+
+                    # Compute mIoU for this frame
+                    if classifier is not None and num_classes is not None and hasattr(viewpoint, 'objects'):
+                        objects = render_pkg["render_object"]
+                        with torch.no_grad():
+                            logits = classifier(objects)
+                            pred_obj = logits.argmax(dim=0)
+                            gt_obj = viewpoint.objects.cuda().long()
+                            miou_test += compute_miou(pred_obj, gt_obj, num_classes)
+
+    
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])  
+
+                report_str = f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test:.4f} PSNR {psnr_test:.4f}"
+                
+                # Format mIoU output and logic
+                if classifier is not None and num_classes is not None:
+                    miou_test /= len(config['cameras'])
+                    report_str += f" mIoU {miou_test:.4f}"
+                    
+                print(report_str)
+
                 if use_wandb:
                     wandb.log({config['name'] + "/loss_viewpoint - l1_loss": l1_test, config['name'] + "/loss_viewpoint - psnr": psnr_test})
         if use_wandb:
@@ -529,7 +713,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 7_000, 30_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 5_000, 7_000, 30_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 7_000, 30_000, 60_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

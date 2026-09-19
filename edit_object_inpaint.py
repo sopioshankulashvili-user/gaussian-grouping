@@ -50,7 +50,7 @@ class RoadConstraintManager:
             return None
         if image_name in self._mask_cache:
             return self._mask_cache[image_name]
-        mask_file = self.road_mask_path / f"{image_name}.png"
+        mask_file = self.road_mask_path / f"{image_name}.jpg" if (self.road_mask_path / f"{image_name}.jpg").exists() else self.road_mask_path / f"{image_name}.png"
         if not mask_file.exists():
             self._mask_cache[image_name] = None
             return None
@@ -92,6 +92,21 @@ class RoadConstraintManager:
         full_mask[road_indices] = True
         return full_mask
 
+
+def build_road_class_mask(gaussians, classifier, road_class_id=1, probability_threshold=0.5, visible_mask=None):
+    with torch.no_grad():
+        logits = classifier(gaussians._objects_dc.permute(2, 0, 1))
+        probs = torch.softmax(logits, dim=0)
+
+    if road_class_id < 0 or road_class_id >= probs.shape[0]:
+        return None
+
+    road_mask = probs[road_class_id, :, 0] >= float(probability_threshold)
+    if visible_mask is not None:
+        if visible_mask.numel() != road_mask.numel():
+            return None
+        road_mask = road_mask & visible_mask.to(device=road_mask.device, dtype=torch.bool)
+    return road_mask
 
 class StyleLoss(nn.Module):
     def __init__(self):
@@ -220,7 +235,7 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
                 constraint_values, plane_info = create_road_height_constraint(
                     gaussians, 
                     road_gaussian_mask, 
-                    height_value=0.5, #if we want to hardcode height
+                    height_value=1e-2, #if we want to hardcode height
                     method='fit_plane_axis_agnostic'
                 )
                 if gaussians.plane_normal is not None and gaussians.plane_centroid is not None:
@@ -277,70 +292,6 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
             (lambda_ssim * loss_ssim) 
             # (0.1 * loss_style)
 
-
-        # ### ROAD CONSTRAINTS ###
-        # # Apply road constraint losses
-        # loss_road_height = None
-        # loss_road_hole = None
-        # if road_constraints_active and iteration % max(1, 1) == 0:
-        #     road_gaussian_mask = road_manager.build_visible_road_mask(gaussians, viewpoint_cam, visibility_filter)
-        #     if road_gaussian_mask is not None and road_gaussian_mask.sum().item() >= min_road_points:
-        #         create_road_height_constraint(
-        #             gaussians,
-        #             road_gaussian_mask,
-        #             height_value=0.5, #if we want to hardcode height
-        #             method='fit_plane_axis_agnostic'
-        #         )
-
-        #         if gaussians.plane_normal is not None and gaussians.plane_centroid is not None:
-        #                 n = gaussians.plane_normal.astype(np.float64)   # [a, b, c]
-        #                 c0 = gaussians.plane_centroid.astype(np.float64)
-        #                 d = -float(np.dot(n, c0))
-        #                 cam_name = getattr(viewpoint_cam, "image_name", "unknown_view")
-        #                 print(
-        #                     f"[Iter {iteration:06d}] [View {cam_name}] "
-        #                     f"Plane: {n[0]:+.6f}x {n[1]:+.6f}y {n[2]:+.6f}z {d:+.6f} = 0"
-        #                 )
-
-        #         constrained_mask = gaussians.height_constrained_mask
-        #         constrained_xyz = gaussians.get_xyz[constrained_mask]
-        #         constrained_targets = gaussians.height_constraint_values[constrained_mask]
-
-        #         if gaussians.plane_normal is not None:
-        #             plane_normal = torch.from_numpy(gaussians.plane_normal).float().to(device=constrained_xyz.device)
-        #             plane_normal = plane_normal / torch.clamp(torch.norm(plane_normal), min=1e-12)
-
-        #             constrained_scaling = gaussians.get_scaling[constrained_mask]
-        #             constrained_rotation = gaussians.get_rotation[constrained_mask]
-        #             q = constrained_rotation / torch.clamp(torch.norm(constrained_rotation, dim=1, keepdim=True), min=1e-12)
-        #             w, x, y, z = q.unbind(dim=1)
-        #             R = torch.empty((q.shape[0], 3, 3), dtype=q.dtype, device=q.device)
-        #             R[:, 0, 0] = 1 - 2 * (y * y + z * z)
-        #             R[:, 0, 1] = 2 * (x * y - w * z)
-        #             R[:, 0, 2] = 2 * (x * z + w * y)
-        #             R[:, 1, 0] = 2 * (x * y + w * z)
-        #             R[:, 1, 1] = 1 - 2 * (x * x + z * z)
-        #             R[:, 1, 2] = 2 * (y * z - w * x)
-        #             R[:, 2, 0] = 2 * (x * z - w * y)
-        #             R[:, 2, 1] = 2 * (y * z + w * x)
-        #             R[:, 2, 2] = 1 - 2 * (x * x + y * y)
-
-        #             normal_batch = plane_normal.view(1, 3, 1).expand(R.shape[0], -1, -1)
-        #             normal_local = torch.bmm(R.transpose(1, 2), normal_batch).squeeze(-1)
-        #             current_cov_along_normal = (constrained_scaling.pow(2) * normal_local.pow(2)).sum(dim=1)
-
-        #             overflow = torch.relu(current_cov_along_normal - constrained_targets)
-        #             loss_road_height = torch.mean(overflow ** 2)
-        #         else:
-        #             loss_road_height = torch.mean((constrained_xyz[:, 2] - constrained_targets) ** 2)
-
-        #         loss = loss + height_loss_weight * loss_road_height
-
-        #         constrained_opacity = gaussians.get_opacity[constrained_mask].squeeze(-1)
-        #         loss_road_hole = torch.relu(min_opacity - constrained_opacity).mean()
-        #         loss = loss + hole_loss_weight * loss_road_hole
-        #     else:
-        #         gaussians.clear_height_constraint()
 
         loss.backward()
 

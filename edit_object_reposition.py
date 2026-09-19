@@ -15,6 +15,7 @@ from random import randint
 
 import cv2
 import lpips
+import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,9 +26,12 @@ from tqdm import tqdm
 from arguments import ModelParams, OptimizationParams, PipelineParams, get_combined_args
 from edit_object_removal import points_inside_convex_hull
 from gaussian_renderer import GaussianModel, render
+from height_constraint import create_road_height_constraint
 from render import feature_to_rgb, visualize_obj
 from scene import Scene
+from scene.dataset_readers import loadCameras
 from utils.general_utils import safe_state
+from utils.camera_utils import generate_interpolated_path, visualizer
 from utils.loss_utils import ssim
 
 
@@ -37,6 +41,20 @@ def safe_torch_load(path, map_location=None):
     except TypeError:
         return torch.load(path, map_location=map_location)
 
+def build_road_class_mask(gaussians, classifier, road_class_id=1, probability_threshold=0.5, visible_mask=None):
+    with torch.no_grad():
+        logits = classifier(gaussians._objects_dc.permute(2, 0, 1))
+        probs = torch.softmax(logits, dim=0)
+
+    if road_class_id < 0 or road_class_id >= probs.shape[0]:
+        return None
+
+    road_mask = probs[road_class_id, :, 0] >= float(probability_threshold)
+    if visible_mask is not None:
+        if visible_mask.numel() != road_mask.numel():
+            return None
+        road_mask = road_mask & visible_mask.to(device=road_mask.device, dtype=torch.bool)
+    return road_mask
 
 class PseudoGTSupervision:
     def __init__(self, pseudo_gt_path):
@@ -53,7 +71,8 @@ class PseudoGTSupervision:
                 return None
             return cached.to(device)
 
-        image_file = self.pseudo_gt_path / f"{image_name}.png"
+        image_file = self.pseudo_gt_path / f"{image_name}.jpeg" if (self.pseudo_gt_path / f"{image_name}.jpeg").exists() else self.pseudo_gt_path / f"{image_name}.png"
+
         if not image_file.exists():
             self._cache[image_name] = None
             return None
@@ -100,30 +119,151 @@ def _quaternion_multiply(q1, q2):
     )
 
 
-def _euler_degrees_to_quaternion(rotation_degrees, device, dtype):
-    rotation_tensor = torch.as_tensor(rotation_degrees, dtype=dtype, device=device).flatten()
-    if rotation_tensor.numel() != 3:
-        raise ValueError("Rotation must contain exactly three values: [rx, ry, rz].")
+def _rotation_vector_to_axis_angle(rotation_vector, device, dtype):
+    """Interpret a 3D Rodrigues vector as axis * angle.
 
-    if rotation_tensor.abs().sum().item() == 0:
+    The vector direction is the rotation axis (plane normal), and its norm is
+    the rotation angle in degrees.
+    """
+    rotation_tensor = torch.as_tensor(rotation_vector, dtype=dtype, device=device).flatten()
+    if rotation_tensor.numel() != 3:
+        raise ValueError("Rotation must contain exactly three values: a Rodrigues vector [rx, ry, rz].")
+
+    angle_degrees = torch.norm(rotation_tensor)
+    if angle_degrees.item() == 0:
+        return None, None
+
+    axis = rotation_tensor / torch.clamp(angle_degrees, min=1e-12)
+    return axis, angle_degrees
+
+
+def _axis_angle_to_rotation_matrix(axis, angle_degrees, device, dtype):
+    axis = torch.as_tensor(axis, dtype=dtype, device=device).flatten()
+    if axis.numel() != 3:
+        raise ValueError("Rotation axis must contain exactly three values.")
+
+    axis_norm = torch.norm(axis)
+    if axis_norm.item() == 0:
+        return torch.eye(3, dtype=dtype, device=device)
+
+    axis = axis / torch.clamp(axis_norm, min=1e-12)
+    theta = torch.deg2rad(torch.as_tensor(angle_degrees, dtype=dtype, device=device))
+    c = torch.cos(theta)
+    s = torch.sin(theta)
+    one_minus_c = 1.0 - c
+
+    x, y, z = axis
+    K = torch.tensor(
+        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
+        dtype=dtype,
+        device=device,
+    )
+    axis_outer = axis.unsqueeze(1) @ axis.unsqueeze(0)
+    identity = torch.eye(3, dtype=dtype, device=device)
+    return c * identity + one_minus_c * axis_outer + s * K
+
+
+def _axis_angle_to_quaternion(axis, angle_degrees, device, dtype):
+    axis = torch.as_tensor(axis, dtype=dtype, device=device).flatten()
+    if axis.numel() != 3:
+        raise ValueError("Rotation axis must contain exactly three values.")
+
+    axis_norm = torch.norm(axis)
+    if axis_norm.item() == 0:
         return torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=dtype, device=device)
 
-    rotation_radians = torch.deg2rad(rotation_tensor)
-    half_angles = rotation_radians * 0.5
-    zero = torch.zeros((), dtype=dtype, device=device)
+    axis = axis / torch.clamp(axis_norm, min=1e-12)
+    theta = torch.deg2rad(torch.as_tensor(angle_degrees, dtype=dtype, device=device))
+    half_theta = theta * 0.5
+    quat = torch.cat([torch.cos(half_theta).unsqueeze(0), axis * torch.sin(half_theta)])
+    return _normalize_quaternions(quat.unsqueeze(0))[0]
 
-    qx = torch.stack([torch.cos(half_angles[0]), torch.sin(half_angles[0]), zero, zero]).unsqueeze(0)
-    qy = torch.stack([torch.cos(half_angles[1]), zero, torch.sin(half_angles[1]), zero]).unsqueeze(0)
-    qz = torch.stack([torch.cos(half_angles[2]), zero, zero, torch.sin(half_angles[2])]).unsqueeze(0)
 
-    # Apply rotations in X -> Y -> Z order.
-    q = _quaternion_multiply(_quaternion_multiply(qz, qy), qx)
-    return _normalize_quaternions(q)[0]
+def _resolve_rotation_axis_and_angle(gaussians, rotation_vector, device, dtype):
+    """Resolve axis-angle rotation using plane normal as axis when available.
+
+    `rotation_vector` can be either:
+      - scalar angle in degrees, or
+      - Rodrigues vector [rx, ry, rz] (legacy path)
+    """
+    rotation_tensor = torch.as_tensor(rotation_vector, dtype=dtype, device=device).flatten()
+    if rotation_tensor.numel() == 1:
+        angle_degrees = torch.abs(rotation_tensor[0])
+        angle_sign = torch.sign(rotation_tensor[0])
+    elif rotation_tensor.numel() == 3:
+        angle_degrees = torch.norm(rotation_tensor)
+        angle_sign = torch.tensor(1.0, dtype=dtype, device=device)
+    else:
+        raise ValueError("Rotation must be either a scalar angle (degrees) or a Rodrigues vector [rx, ry, rz].")
+
+    if angle_degrees.item() == 0:
+        return None, None
+
+    plane_normal = getattr(gaussians, "plane_normal", None)
+    if plane_normal is not None:
+        axis = torch.as_tensor(plane_normal, dtype=dtype, device=device).flatten()
+        if axis.numel() != 3:
+            raise ValueError("gaussians.plane_normal must contain exactly three values.")
+        axis_norm = torch.norm(axis)
+        if axis_norm.item() > 0:
+            axis = axis / torch.clamp(axis_norm, min=1e-12)
+            if angle_sign.item() < 0:
+                axis = -axis
+            return axis, angle_degrees
+
+    if rotation_tensor.numel() == 1:
+        axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device)
+        if angle_sign.item() < 0:
+            axis = -axis
+        return axis, angle_degrees
+
+    axis = rotation_tensor / torch.clamp(angle_degrees, min=1e-12)
+    return axis, angle_degrees
+
+
+def _store_plane_normal_and_centroid(gaussians, axis, centroid):
+    if axis is None or centroid is None:
+        return
+    gaussians.plane_normal = axis.detach().cpu().numpy()
+    gaussians.plane_centroid = centroid.detach().cpu().numpy()
+
+
+def _ensure_plane_info_for_rotation(gaussians, plane_mask):
+    """Populate gaussians.plane_normal/plane_centroid using height-constraint logic."""
+    if getattr(gaussians, "plane_normal", None) is not None and getattr(gaussians, "plane_centroid", None) is not None:
+        print("[Reposition] Plane normal and centroid already exist, skipping plane estimation.")
+        print(f"[Reposition] Stored plane normal: {gaussians.plane_normal}")
+        print(f"[Reposition] Stored plane centroid: {gaussians.plane_centroid}")
+        return True
+
+    if plane_mask is None:
+        return False
+
+    plane_mask = plane_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).flatten()
+    if plane_mask.numel() != gaussians.get_xyz.shape[0]:
+        return False
+    if int(plane_mask.sum().item()) < 3:
+        return False
+
+    try:
+        create_road_height_constraint(
+            gaussians,
+            plane_mask,
+            height_value=1e-2,
+            method="fit_plane_axis_agnostic",
+        )
+    except Exception as exc:
+        print(f"[Reposition] Failed to estimate plane info for rotation: {exc}")
+        return False
+    
+    return getattr(gaussians, "plane_normal", None) is not None and getattr(gaussians, "plane_centroid", None) is not None
 
 
 def _apply_rotation_to_gaussian_subset(gaussians, mask3d, rotation_degrees, translate_center=None):
-    rotation_tensor = torch.as_tensor(rotation_degrees, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
-    if rotation_tensor.abs().sum().item() == 0:
+    rotation_axis, rotation_angle = _resolve_rotation_axis_and_angle(
+        gaussians, rotation_degrees, gaussians.get_xyz.device, gaussians.get_xyz.dtype
+    )
+    if rotation_axis is None:
         return None
 
     selected_xyz = gaussians._xyz.data[mask3d].detach().clone()
@@ -135,9 +275,9 @@ def _apply_rotation_to_gaussian_subset(gaussians, mask3d, rotation_degrees, tran
     else:
         center = torch.as_tensor(translate_center, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
 
-    delta_quaternion = _euler_degrees_to_quaternion(rotation_tensor, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
-    delta_quaternion = delta_quaternion.unsqueeze(0)
-    rotation_matrix = _quaternion_to_rotation_matrix(delta_quaternion)[0]
+    _store_plane_normal_and_centroid(gaussians, rotation_axis, center)
+    delta_quaternion = _axis_angle_to_quaternion(rotation_axis, rotation_angle, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
+    rotation_matrix = _axis_angle_to_rotation_matrix(rotation_axis, rotation_angle, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
 
     with torch.no_grad():
         centered_xyz = selected_xyz - center.unsqueeze(0)
@@ -148,7 +288,7 @@ def _apply_rotation_to_gaussian_subset(gaussians, mask3d, rotation_degrees, tran
         if selected_rotation.shape[1] != 4:
             raise ValueError("Gaussian rotations are expected to be quaternions with four components.")
 
-        delta_quaternion_batch = delta_quaternion.expand(selected_rotation.shape[0], -1)
+        delta_quaternion_batch = delta_quaternion.unsqueeze(0).expand(selected_rotation.shape[0], -1)
         rotated_quaternion = _quaternion_multiply(delta_quaternion_batch, selected_rotation)
         gaussians._rotation.data[mask3d] = _normalize_quaternions(rotated_quaternion)
 
@@ -168,19 +308,22 @@ def duplicate_and_rotate_selected_gaussians(gaussians, mask3d, rotation_degrees)
             Marks original selected gaussians and rotated duplicates.
         rotated_only_mask: Bool mask of length N+M marking only rotated duplicates.
     """
-    rotation_tensor = torch.as_tensor(rotation_degrees, dtype=gaussians.get_xyz.dtype, device=gaussians.get_xyz.device)
+    rotation_axis, rotation_angle = _resolve_rotation_axis_and_angle(
+        gaussians, rotation_degrees, gaussians.get_xyz.device, gaussians.get_xyz.dtype
+    )
     n_original = gaussians._xyz.shape[0]
     n_selected = int(mask3d.sum().item())
 
-    if rotation_tensor.abs().sum().item() == 0 or n_selected == 0:
+    if rotation_axis is None or n_selected == 0:
         rotated_only_mask = torch.zeros_like(mask3d, dtype=torch.bool)
         return mask3d, rotated_only_mask
 
     with torch.no_grad():
         selected_xyz = gaussians._xyz[mask3d].detach().clone()
         center = selected_xyz.mean(dim=0)
-        delta_quaternion = _euler_degrees_to_quaternion(rotation_tensor, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
-        rotation_matrix = _quaternion_to_rotation_matrix(delta_quaternion.unsqueeze(0))[0]
+        _store_plane_normal_and_centroid(gaussians, rotation_axis, center)
+        delta_quaternion = _axis_angle_to_quaternion(rotation_axis, rotation_angle, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
+        rotation_matrix = _axis_angle_to_rotation_matrix(rotation_axis, rotation_angle, gaussians.get_xyz.device, gaussians.get_xyz.dtype)
 
         xyz_new = (selected_xyz - center.unsqueeze(0)) @ rotation_matrix.t() + center.unsqueeze(0)
         features_dc_new = gaussians._features_dc[mask3d].detach().clone()
@@ -297,6 +440,69 @@ def _composite_two_passes(bg_pkg, fg_pkg, background):
     render_obj_out = torch.where(fg_mask, fg_pkg["render_object"], bg_pkg["render_object"])
     
     return render_out, render_obj_out
+
+
+def _render_with_optional_two_pass(view, gaussians, pipeline, background, fg_mask=None):
+    fg_mask = getattr(gaussians, "reposition_foreground_mask", fg_mask)
+    if fg_mask is None or fg_mask.numel() != gaussians._xyz.shape[0]:
+        return render(view, gaussians, pipeline, background)
+
+    fg_mask = fg_mask.to(device=gaussians._xyz.device, dtype=torch.bool).flatten()
+    bg_pkg = _render_with_active_mask(view, gaussians, pipeline, background, ~fg_mask)
+    fg_pkg = _render_with_active_mask(view, gaussians, pipeline, background, fg_mask)
+    rendering, rendering_obj = _composite_two_passes(bg_pkg, fg_pkg, background)
+    return {"render": rendering, "render_object": rendering_obj}
+
+
+def save_interpolate_pose(model_path, iteration, num_views):
+    """Generate smooth interpolated camera poses from optimized poses."""
+    model_path = Path(model_path)
+    org_pose = np.load(model_path / f"pose/ours_{iteration}/pose_optimized.npy")
+    visualizer(org_pose, ["green" for _ in org_pose], model_path / f"pose/ours_{iteration}/poses_optimized.png")
+
+    n_interp = int(10 * 30 / num_views)
+    all_inter_pose = []
+    for i in range(num_views - 1):
+        tmp_inter_pose = generate_interpolated_path(poses=org_pose[i : i + 2], n_interp=n_interp)
+        all_inter_pose.append(tmp_inter_pose)
+    all_inter_pose = np.concatenate(all_inter_pose, axis=0)
+    all_inter_pose = np.concatenate([all_inter_pose, org_pose[-1][:3, :].reshape(1, 3, 4)], axis=0)
+
+    inter_pose_list = []
+    for p in all_inter_pose:
+        tmp_view = np.eye(4)
+        tmp_view[:3, :3] = p[:3, :3]
+        tmp_view[:3, 3] = p[:3, 3]
+        inter_pose_list.append(tmp_view)
+
+    inter_pose = np.stack(inter_pose_list, 0)
+    visualizer(inter_pose, ["blue" for _ in inter_pose], model_path / f"pose/ours_{iteration}/poses_interpolated.png")
+    np.save(model_path / f"pose/ours_{iteration}/pose_interpolated.npy", inter_pose)
+
+
+def images_to_video(image_folder, output_video_path, fps=30):
+    images = []
+    for filename in sorted(os.listdir(image_folder)):
+        if filename.endswith((".png", ".jpg", ".jpeg", ".JPG", ".PNG")):
+            image_path = os.path.join(image_folder, filename)
+            images.append(imageio.imread(image_path))
+    imageio.mimwrite(output_video_path, images, fps=fps)
+
+
+def render_interpolated_set(model_path, name, iteration, pose_iteration, views, gaussians, pipeline, background):
+    render_path = os.path.join(model_path, name, f"ours_interp_{iteration}", "renders")
+    makedirs(render_path, exist_ok=True)
+
+    for idx, view in enumerate(tqdm(views, desc="Rendering interpolated progress")):
+        results = _render_with_optional_two_pass(view, gaussians, pipeline, background)
+        rendering = results["render"]
+        torchvision.utils.save_image(rendering, os.path.join(render_path, f"{idx:05d}.png"))
+        #image saved on path
+        print(f"Saved rendered image to {os.path.join(render_path, f'{idx:05d}.png')}")
+
+    output_video_name = f"{name}_interp_video.mp4"
+    images_to_video(render_path, os.path.join(render_path[:-8], output_video_name), fps=30)
+    print(f"Video saved to {os.path.join(render_path[:-8], output_video_name)}")
 
 
 def reduce_opacity_in_destination(gaussians, translated_mask3d, target_opacity=0.05, blend_radius=0.05):
@@ -524,7 +730,17 @@ def finetune_reposition(
     target_anchor_mask = mask3d
 
     has_translation = np.abs(np.asarray(translation, dtype=np.float32)).sum() > 0
-    has_rotation = np.abs(np.asarray(rotation, dtype=np.float32)).sum() > 0
+    has_rotation = abs(float(rotation)) > 0
+
+    if has_rotation:
+        road_gaussian_mask = build_road_class_mask(
+                    gaussians,
+                    classifier,
+                    road_class_id=1,
+                    probability_threshold=0.4,
+                    visible_mask=None,
+                )
+        _ensure_plane_info_for_rotation(gaussians, road_gaussian_mask)
 
     if keep_original_gaussians:
         if has_translation:
@@ -547,6 +763,11 @@ def finetune_reposition(
         if has_rotation:
             apply_rotation_to_selected_gaussians(gaussians, mask3d, rotation)
         mask3d_for_optimizer = mask3d
+
+    # if has_rotation and getattr(gaussians, "plane_normal", None) is not None:
+    #     print(f"[Reposition] Stored plane normal: {gaussians.plane_normal}")
+    #     if getattr(gaussians, "plane_centroid", None) is not None:
+    #         print(f"[Reposition] Stored plane centroid: {gaussians.plane_centroid}")
     
     mask3d_for_pseudo_repositioned = mask3d_for_optimizer
 
@@ -556,6 +777,7 @@ def finetune_reposition(
     source_neighborhood_mask = points_inside_convex_hull(
         source_xyz_before_translation, source_anchor_mask_original, outlier_factor=1.0
     )
+
     if source_neighborhood_mask.shape[0] != target_anchor_mask.shape[0]:
         source_neighborhood_mask_expanded = torch.zeros_like(target_anchor_mask, dtype=torch.bool)
         source_neighborhood_mask_expanded[: source_neighborhood_mask.shape[0]] = source_neighborhood_mask
@@ -653,7 +875,7 @@ def finetune_reposition(
     #                         source_neighborhood_mask = source_neighborhood_mask[keep_mask]
 
 
-    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition_copy/iteration_{iteration}")
+    point_cloud_path = os.path.join(model_path, f"point_cloud_object_reposition/iteration_{iteration}")
     gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
     return gaussians
 
@@ -672,18 +894,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(pred_obj_path, exist_ok=True)
     makedirs(pointcloud_path, exist_ok=True)
 
-    fg_mask = getattr(gaussians, "reposition_foreground_mask", None)
-    use_two_pass = fg_mask is not None and fg_mask.numel() == gaussians._xyz.shape[0]
-    # use_two_pass = False
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if use_two_pass:
-            fg_mask = fg_mask.to(device=gaussians._xyz.device, dtype=torch.bool).flatten()
-            bg_pkg = _render_with_active_mask(view, gaussians, pipeline, background, ~fg_mask)
-            fg_pkg = _render_with_active_mask(view, gaussians, pipeline, background, fg_mask)
-            rendering, rendering_obj = _composite_two_passes(bg_pkg, fg_pkg, background)
-            results = {"render": rendering, "render_object": rendering_obj}
-        else:
-            results = render(view, gaussians, pipeline, background)
+        results = _render_with_optional_two_pass(view, gaussians, pipeline, background)
         rendering = results["render"]
         rendering_obj = results["render_object"]
         logits = classifier(rendering_obj)
@@ -740,9 +952,12 @@ def reposition(
     opacity_blend_target: float = 0.0,
     opacity_blend_radius: float = 0.1,
     keep_original_gaussians: bool = False,
+    infer_video: bool = False,
+    num_views: int = 10,
 ):
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    pose_iteration = scene.loaded_iter
     num_classes = dataset.num_classes
     print("Num classes:", num_classes)
     classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
@@ -777,7 +992,7 @@ def reposition(
 
     dataset.object_path = "object_mask"
     dataset.images = "images"
-    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition_copy/iteration_{scene.loaded_iter}", shuffle=False)
+    scene = Scene(dataset, gaussians, load_iteration=f"_object_reposition/iteration_{scene.loaded_iter}", shuffle=False)
 
     with torch.no_grad():
         if not skip_train:
@@ -791,6 +1006,24 @@ def reposition(
                 background,
                 classifier,
             )
+
+        if infer_video:
+            try:
+                # save_interpolate_pose(Path(dataset.model_path), pose_iteration, num_views)
+                interp_pose = np.load(Path(dataset.model_path) / "pose" / f"ours_{pose_iteration}" / "pose_interpolated.npy")
+                viewpoint_stack = loadCameras(interp_pose, scene.getTrainCameras())
+                render_interpolated_set(
+                    dataset.model_path,
+                    "interp",
+                    scene.loaded_iter,
+                    pose_iteration,
+                    viewpoint_stack,
+                    gaussians,
+                    pipeline,
+                    background,
+                )
+            except Exception as e:
+                print(f"Warning: Could not render interpolated poses: {e}")
         if not skip_test:
             render_set(
                 dataset.model_path,
@@ -818,14 +1051,14 @@ if __name__ == "__main__":
     parser.add_argument("--translation_dx", type=float, default=0.0, help="Translation in world x-axis")
     parser.add_argument("--translation_dy", type=float, default=0.0, help="Translation in world y-axis")
     parser.add_argument("--translation_dz", type=float, default=0.0, help="Translation in world z-axis")
-    parser.add_argument("--rotation_rx", type=float, default=0.0, help="Rotation around world x-axis in degrees")
-    parser.add_argument("--rotation_ry", type=float, default=0.0, help="Rotation around world y-axis in degrees")
-    parser.add_argument("--rotation_rz", type=float, default=0.0, help="Rotation around world z-axis in degrees")
+    parser.add_argument("--rotation_angle", type=float, default=0.0, help="Rotation angle in degrees around plane normal")
     parser.add_argument("--pseudo_gt_path", type=str, default="", help="Directory containing pseudo-GT images as <image_name>.png")
     parser.add_argument("--enable_opacity_blending", action="store_true", help="Enable opacity reduction in destination area for better blending")
     parser.add_argument("--opacity_blend_target", type=float, default=1e-5, help="Target opacity for gaussians in destination area")
     parser.add_argument("--opacity_blend_radius", type=float, default=0.1, help="Radius around translated gaussians to affect for blending")
     parser.add_argument("--keep_original_gaussians", action="store_true", help="Keep the original gaussians in place and duplicate them at the transformed location")
+    parser.add_argument("--infer_video", action="store_true", help="Generate an interpolated video with smooth camera poses")
+    parser.add_argument("--num_views", default=10, type=int, help="Number of keyframe views for interpolation")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -864,15 +1097,22 @@ if __name__ == "__main__":
 
     cfg_rotation = config.get("rotation", None)
     if cfg_rotation is not None:
-        if not isinstance(cfg_rotation, list) or len(cfg_rotation) != 3:
-            raise ValueError("Config key 'rotation' must be a list [rx, ry, rz] in degrees.")
-        args.rotation_rx = float(cfg_rotation[0])
-        args.rotation_ry = float(cfg_rotation[1])
-        args.rotation_rz = float(cfg_rotation[2])
+        if isinstance(cfg_rotation, list):
+            if len(cfg_rotation) != 3:
+                raise ValueError("Config key 'rotation' must be a list [rx, ry, rz] or provide 'rotation_angle'.")
+            args.rotation_angle = float(np.linalg.norm(np.asarray(cfg_rotation, dtype=np.float32)))
+            print("[Reposition] Legacy 'rotation' vector detected; converted to scalar 'rotation_angle'.")
+        else:
+            args.rotation_angle = float(cfg_rotation)
     else:
-        args.rotation_rx = config.get("rotation_rx", args.rotation_rx)
-        args.rotation_ry = config.get("rotation_ry", args.rotation_ry)
-        args.rotation_rz = config.get("rotation_rz", args.rotation_rz)
+        if "rotation_angle" in config:
+            args.rotation_angle = float(config.get("rotation_angle", args.rotation_angle))
+        elif any(k in config for k in ["rotation_rx", "rotation_ry", "rotation_rz"]):
+            rx = float(config.get("rotation_rx", 0.0))
+            ry = float(config.get("rotation_ry", 0.0))
+            rz = float(config.get("rotation_rz", 0.0))
+            args.rotation_angle = float(np.linalg.norm(np.asarray([rx, ry, rz], dtype=np.float32)))
+            print("[Reposition] Legacy rotation_rx/ry/rz detected; converted to scalar 'rotation_angle'.")
 
     args.pseudo_gt_path = config.get("pseudo_gt_path", args.pseudo_gt_path)
 
@@ -880,11 +1120,13 @@ if __name__ == "__main__":
     args.opacity_blend_target = config.get("opacity_blend_target", args.opacity_blend_target)
     args.opacity_blend_radius = config.get("opacity_blend_radius", args.opacity_blend_radius)
     args.keep_original_gaussians = config.get("keep_original_gaussians", args.keep_original_gaussians)
+    args.infer_video = config.get("infer_video", args.infer_video)
+    args.num_views = config.get("num_views", args.num_views)
 
     translation = [args.translation_dx, args.translation_dy, args.translation_dz]
-    rotation = [args.rotation_rx, args.rotation_ry, args.rotation_rz]
+    rotation = float(args.rotation_angle)
     print(f"Using translation: {translation}")
-    print(f"Using rotation (degrees): {rotation}")
+    print(f"Using rotation angle (degrees): {rotation}")
     print(f"Pseudo-GT path: {args.pseudo_gt_path}")
 
     safe_state(args.quiet)
@@ -906,4 +1148,6 @@ if __name__ == "__main__":
         opacity_blend_target=args.opacity_blend_target,
         opacity_blend_radius=args.opacity_blend_radius,
         keep_original_gaussians=args.keep_original_gaussians,
+        infer_video=args.infer_video,
+        num_views=args.num_views,
     )

@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --time=1-0
 #SBATCH --partition=3090
-#SBATCH -J lowmargin
+#SBATCH -J milan_reposition
 
 
 echo "Starting job ${SLURM_JOB_ID} on ${SLURMD_NODENAME}"
@@ -18,4 +18,7 @@ conda activate gaussian_grouping
 
 
 # Remove the selected object
-python edit_object_reposition.py  -m output/small_city_50/25 --config_file config/object_reposition/road_damage.json --iteration 7000
+# python edit_object_reposition.py  -m output/small_city_50/25 --config_file config/object_reposition/road_damage_smallcity.json --iteration 7000
+python edit_object_reposition.py  -m output/milan/4 --config_file config/object_reposition/road_damage.json --iteration 7000
+
+# python edit_object_reposition.py  -m output/small_city_50/crack_reduced --config_file config/object_reposition/road_damage.json --iteration 5000

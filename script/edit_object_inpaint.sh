@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --time=1-0
 #SBATCH --partition=3090
-#SBATCH -J noconstr_direct
+#SBATCH -J inp_novel_view
 
 
 echo "Starting job ${SLURM_JOB_ID} on ${SLURMD_NODENAME}"
@@ -33,7 +33,9 @@ conda activate gaussian_grouping
 
 
 # Remove the selected object
-python edit_object_inpaint.py  -m output/small_city_50/25 --config_file config/object_inpaint/road_damage.json --inpaint_strategy "direct" --iteration 7000
+# python edit_object_inpaint.py  -m output/milan/4 --config_file config/object_inpaint/road_damage.json --inpaint_strategy "direct" --iteration 7000
+# python edit_object_inpaint.py  -m output/small_city_50/25 --config_file config/object_inpaint/road_damage.json --inpaint_strategy "direct" --iteration 7000
 
 
 
+python render_interpolated.py -m output/milan/4 --num_classes 3 --num_views 25 --iteration 999
