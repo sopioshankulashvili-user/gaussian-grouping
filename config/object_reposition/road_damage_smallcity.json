@@ -1,16 +1,16 @@
 {
   "num_classes": 3,
   "select_obj_id": [2],
-  "removal_thresh": 0.7,
-  "images": "/data/sopio/milan/4/images",
-  "object_path": "/data/sopio/milan/4/object_mask",
+  "removal_thresh": 0.4,
+  "images": "/data/sopio/small_city_50/25/images",
+  "object_path": "/data/sopio/small_city_50/25/object_mask",
   "r": 1,
   "lambda_dlpips": 0.5,
   "reposition_lambda_ssim": 0.2,
   "finetune_iteration":1000,
   "translation": [-0.1, 0.0, 0.0],
-  "rotation_angle": -10.0,
-  "pseudo_gt_path": "/data/sopio/milan/4/inpainted",
+  "rotation_angle": 20.0,
+  "pseudo_gt_path": "/data/sopio/small_city_50/25_inpainted/images",
   "enable_opacity_blending": false,
   "keep_original_gaussians": true
 }

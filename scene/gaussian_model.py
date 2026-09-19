@@ -185,6 +185,7 @@ class GaussianModel:
 
                 exceed_mask = current_var_along_normal > (target_var_along_normal + 1e-12)
                 if not exceed_mask.any():
+                    print("Curr val", current_var_along_normal)
                     print("exiting due to no exceed mask")
                     return
 
